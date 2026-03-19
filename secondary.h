@@ -16,6 +16,7 @@
 #include "memtag.h"
 #include "mutex.h"
 #include "options.h"
+#include "shared_arena.h"
 #include "stats.h"
 #include "string_utils.h"
 #include "thread_annotations.h"
@@ -594,6 +595,11 @@ public:
     Stats.init();
     if (LIKELY(S))
       S->link(&Stats);
+#if SCUDO_LINUX
+    // 初始化每核心共享内存池（DESIGN.md §2.1）。
+    // 若初始化失败（如权限不足），分配器回退到原有 mmap 路径，不影响正确性。
+    SharedArenaPool::getInstance().init();
+#endif
   }
 
   void *allocate(const Options &Options, uptr Size, uptr AlignmentHint = 0,
@@ -604,6 +610,11 @@ public:
 
   void *tryAllocateFromCache(const Options &Options, uptr Size, uptr Alignment,
                              uptr *BlockEndPtr, FillContentsMode FillContents);
+
+  // 尝试从每核心共享内存池（SharedArena）中分配大块内存。
+  // 命中时无需 mmap 系统调用，实现跨进程零拷贝委托（DESIGN.md §2.2）。
+  void *tryAllocateFromArena(const Options &Options, uptr Size, uptr Alignment,
+                              uptr *BlockEndPtr, FillContentsMode FillContents);
 
   static uptr getBlockEnd(void *Ptr) {
     auto *B = LargeBlock::getHeader<Config>(Ptr);
@@ -730,6 +741,80 @@ MapAllocator<Config>::tryAllocateFromCache(const Options &Options, uptr Size,
   }
   return Ptr;
 }
+// tryAllocateFromArena — 从每核心共享 Arena 获取大块内存（DESIGN.md §2.2）
+//
+// 实现要点：
+//  - Arena 块的虚拟地址固定（shm 映射在所有进程同一 VA），无需 mmap 系统调用。
+//  - 首尾各设置一个 PROT_NONE guard page（通过 mprotect，仅影响当前进程 VMA），
+//    与 mmap 路径保持一致的越界检测能力。
+//  - MemMap 记录完整区域（含 guard page），CommitBase/CommitSize 为可用区间；
+//    deallocate 时通过 MemMap 恢复 guard page 权限后归还 Arena。
+//  - 内存标签（MTE）暂不支持（Demo 阶段），遇到 tagging 选项直接返回 nullptr。
+#if SCUDO_LINUX
+template <typename Config>
+void *MapAllocator<Config>::tryAllocateFromArena(const Options &Options,
+                                                  uptr Size, uptr Alignment,
+                                                  uptr *BlockEndPtr,
+                                                  FillContentsMode FillContents) {
+
+  // Arena 不支持内存标签（MTE），回退到 mmap 路径。
+  // if (useMemoryTagging<Config>(Options))
+  //   return nullptr;
+
+  SharedArenaPool &Pool = SharedArenaPool::getInstance();
+  if (!Pool.isReady())
+    return nullptr;
+
+  SharedArena *Arena = Pool.getCurrentArena();
+  if (!Arena)
+    return nullptr;
+
+  // 纯用户态快速路径：从 Arena freelist 取块，全程零系统调用。
+  // 不设置 guard page（mprotect 需陷入内核，违背零内核调用设计意图）。
+  // 安全保障由 §2.3 Bitmap + 上下文切换解绑机制提供（独立实现）。
+  uptr OutCommitBase    = 0;
+  uptr OutCommitSize    = 0;
+  uptr OutEntryHeaderPos = 0;
+
+  if (!Arena->retrieve(Size, Alignment, getHeadersSize(), OutCommitBase,
+                        OutCommitSize, OutEntryHeaderPos))
+    return nullptr;
+
+  LargeBlock::Header *H = reinterpret_cast<LargeBlock::Header *>(
+      LargeBlock::addHeaderTag<Config>(OutEntryHeaderPos));
+
+  H->CommitBase = OutCommitBase;
+  H->CommitSize = OutCommitSize;
+  H->MemMap = MemMapT(OutCommitBase, OutCommitSize);
+
+  const uptr BlockEnd = H->CommitBase + H->CommitSize;
+  if (BlockEndPtr)
+    *BlockEndPtr = BlockEnd;
+  uptr HInt = reinterpret_cast<uptr>(H);
+  if (allocatorSupportsMemoryTagging<Config>())
+    HInt = untagPointer(HInt);
+  const uptr PtrInt = HInt + LargeBlock::getHeaderSize();
+  void *Ptr = reinterpret_cast<void *>(PtrInt);
+  if (FillContents)
+    memset(Ptr, FillContents == ZeroFill ? 0 : PatternFillByte,
+           BlockEnd - PtrInt);
+  {
+    ScopedLock L(Mutex);
+    InUseBlocks.push_back(H);
+    AllocatedBytes += H->CommitSize;
+    if (LargestSize < H->CommitSize)
+      LargestSize = H->CommitSize;
+    NumberOfAllocs++;
+    Stats.add(StatAllocated, H->CommitSize);
+    Stats.add(StatMapped, H->MemMap.getCapacity());
+  }
+  sharedArenaTrace("allocate hit core=%u request_size=%zu alignment=%zu ptr=0x%zx commit_base=0x%zx commit_size=%zu",
+                   Arena->getCoreId(), Size, Alignment,
+                   reinterpret_cast<uptr>(Ptr), OutCommitBase, OutCommitSize);
+  return Ptr;
+}
+#endif // SCUDO_LINUX
+
 // As with the Primary, the size passed to this function includes any desired
 // alignment, so that the frontend can align the user allocation. The hint
 // parameter allows us to unmap spurious memory when dealing with larger
@@ -753,6 +838,22 @@ void *MapAllocator<Config>::allocate(const Options &Options, uptr Size,
   // Note that cached blocks may have aligned address already. Thus we simply
   // pass the required size (`Size` + `getHeadersSize()`) to do cache look up.
   const uptr MinNeededSizeForCache = roundUp(Size + getHeadersSize(), PageSize);
+
+#if SCUDO_LINUX
+  // 内存压力水位线机制（DESIGN.md §2.1）：
+  // Arena 替代 MapAllocatorCache，仅接管 Cache 能处理的尺寸范围。
+  // 超过 Cache MaxEntrySize 的分配仍走 mmap 路径（deallocate 时 unmap）。
+  {
+    SharedArenaPool &Pool = SharedArenaPool::getInstance();
+    if (Pool.shouldUseArena() && Alignment < PageSize &&
+        Cache.canCache(MinNeededSizeForCache)) {
+      void *Ptr = tryAllocateFromArena(Options, Size, Alignment, BlockEndPtr,
+                                       FillContents);
+      if (Ptr != nullptr)
+        return Ptr;
+    }
+  }
+#endif // SCUDO_LINUX
 
   if (Alignment < PageSize && Cache.canCache(MinNeededSizeForCache)) {
     void *Ptr = tryAllocateFromCache(Options, Size, Alignment, BlockEndPtr,
@@ -850,6 +951,26 @@ void MapAllocator<Config>::deallocate(const Options &Options, void *Ptr)
     Stats.sub(StatAllocated, CommitSize);
     Stats.sub(StatMapped, H->MemMap.getCapacity());
   }
+
+#if SCUDO_LINUX
+  // Arena 块释放路径（DESIGN.md §2.1 缓存交接 + §2.4 跨核迁移）：
+  // 纯用户态：将块按 VA 有序存入归属 Arena 的侵入式空闲链表，零系统调用。
+  {
+    SharedArenaPool &Pool = SharedArenaPool::getInstance();
+    const uptr FullBase = H->MemMap.getBase();
+    const uptr FullSize = H->MemMap.getCapacity();
+    if (Pool.isReady() && Pool.isArenaAddr(FullBase)) {
+      SharedArena *Owner = Pool.getOwningArena(FullBase);
+      if (LIKELY(Owner != nullptr)) {
+        Owner->store(FullBase, FullSize);
+        sharedArenaTrace("deallocate return core=%u ptr=0x%zx base=0x%zx size=%zu",
+                         Owner->getCoreId(), reinterpret_cast<uptr>(Ptr),
+                         FullBase, FullSize);
+      }
+      return;
+    }
+  }
+#endif // SCUDO_LINUX
 
   if (Cache.canCache(H->CommitSize)) {
     Cache.store(Options, H->CommitBase, H->CommitSize,

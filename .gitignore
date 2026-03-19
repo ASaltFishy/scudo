@@ -11,4 +11,9 @@
 *.res
 *.ico
 
+settings.json
+*.log
+
 .cursor/
+scudo_tests
+scudo_secondary_tests

@@ -90,6 +90,7 @@ set(SCUDO_HEADERS
   report.h
   report_linux.h
   secondary.h
+  shared_arena.h
   size_class_map.h
   stack_depot.h
   stats.h
@@ -121,6 +122,7 @@ set(SCUDO_SOURCES
   release.cpp
   report.cpp
   report_linux.cpp
+  shared_arena_linux.cpp
   string_utils.cpp
   timing.cpp
   )
