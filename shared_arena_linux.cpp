@@ -61,30 +61,93 @@ __attribute__((weak)) extern const unsigned int __rseq_size;
 
 namespace scudo {
 
+static atomic_u32 SharedArenaForceForTesting = {};
+static atomic_u32 SharedArenaTraceCount = {};
+
+static SharedArenaPool SharedArenaPoolSingleton;
+
+SharedArenaPool &SharedArenaPool::getInstance() {
+  return SharedArenaPoolSingleton;
+}
+
 static bool sharedArenaEnvEnabled(const char *Name) {
   const char *Value = getenv(Name);
   return Value != nullptr && Value[0] != '\0' && Value[0] != '0';
 }
 
+// Cache environment variables once per process to avoid concurrent getenv()
+// calls across threads (thread-safety). We still allow unit tests to setenv()
+// in child processes before any allocation, then the first cache init will read
+// the updated env values.
+static atomic_u32 SharedArenaEnvCacheState = {};
+static atomic_u32 SharedArenaEnvAttach = {};
+static atomic_u32 SharedArenaEnvForce = {};
+static atomic_u32 SharedArenaEnvTrace = {};
+
+static void initSharedArenaEnvCacheOnce() {
+  // 0: uninitialized, 1: initialized
+  u32 Expected = 0u;
+  if (atomic_compare_exchange_strong(&SharedArenaEnvCacheState, &Expected, 1u,
+                                      memory_order_acq_rel)) {
+    // First thread initializes cached values.
+    atomic_store(&SharedArenaEnvAttach, sharedArenaEnvEnabled("SCUDO_SHARED_ARENA_ATTACH")
+                                           ? 1u
+                                           : 0u,
+                memory_order_relaxed);
+    atomic_store(&SharedArenaEnvForce, sharedArenaEnvEnabled("SCUDO_SHARED_ARENA_FORCE")
+                                            ? 1u
+                                            : 0u,
+                memory_order_relaxed);
+    atomic_store(&SharedArenaEnvTrace, sharedArenaEnvEnabled("SCUDO_SHARED_ARENA_TRACE")
+                                            ? 1u
+                                            : 0u,
+                memory_order_relaxed);
+    return;
+  }
+
+  // Other threads spin until initialization completes.
+  while (atomic_load(&SharedArenaEnvCacheState, memory_order_acquire) == 0u)
+    ;
+}
+
+static bool sharedArenaAttachEnabled() {
+  initSharedArenaEnvCacheOnce();
+  return atomic_load(&SharedArenaEnvAttach, memory_order_relaxed) != 0u;
+}
+
 bool sharedArenaForceEnabled() {
-  static const bool Enabled = sharedArenaEnvEnabled("SCUDO_SHARED_ARENA_FORCE");
-  return Enabled;
+  initSharedArenaEnvCacheOnce();
+  const u32 Override =
+      atomic_load(&SharedArenaForceForTesting, memory_order_relaxed);
+  if (Override == 2u)
+    return true;
+  if (Override == 1u)
+    return false;
+  return atomic_load(&SharedArenaEnvForce, memory_order_relaxed) != 0u;
+}
+
+void setSharedArenaForceForTesting(bool Enabled) {
+  atomic_store(&SharedArenaForceForTesting, Enabled ? 2u : 1u,
+               memory_order_relaxed);
+}
+
+void clearSharedArenaForceForTesting() {
+  atomic_store(&SharedArenaForceForTesting, 0u, memory_order_relaxed);
 }
 
 bool sharedArenaTraceEnabled() {
-  static const bool Enabled = sharedArenaEnvEnabled("SCUDO_SHARED_ARENA_TRACE");
-  return Enabled;
+  initSharedArenaEnvCacheOnce();
+  return atomic_load(&SharedArenaEnvTrace, memory_order_relaxed) != 0u;
 }
 
 void sharedArenaTrace(const char *Format, ...) {
   if (!sharedArenaTraceEnabled())
     return;
 
-  static atomic_u32 TraceCount = {};
   const u32 Count =
-      atomic_fetch_add(&TraceCount, 1u, memory_order_relaxed);
+      atomic_fetch_add(&SharedArenaTraceCount, 1u, memory_order_relaxed);
   if (Count >= 64) {
-    if (Count == 64) {
+    if (Count == 64) {  
       static constexpr char LimitMsg[] =
           "[scudo][shared_arena] trace limit reached, suppressing further logs\n";
       write(STDERR_FILENO, LimitMsg, sizeof(LimitMsg) - 1);
@@ -100,7 +163,8 @@ void sharedArenaTrace(const char *Format, ...) {
 
   va_list Args;
   va_start(Args, Format);
-  int BodyLen = vsnprintf(Buffer + PrefixLen, sizeof(Buffer) - PrefixLen,
+  int BodyLen = vsnprintf(Buffer + PrefixLen,
+                          sizeof(Buffer) - static_cast<size_t>(PrefixLen),
                           Format, Args);
   va_end(Args);
   if (BodyLen < 0)
@@ -536,12 +600,16 @@ void SharedArenaPool::init() NO_THREAD_SAFETY_ANALYSIS{
   // 清理上一次进程会话遗留的共享内存。
   // /dev/shm (tmpfs) 上的文件在进程退出后仍然存在，其中的元数据
   //（freelist head、entries 等）对应旧进程的状态，直接复用会导致崩溃。
-  // 跨进程共享场景下，首进程调用 init() 创建新 Arena，后续进程应通过
-  // 独立的 attach() 路径加入（attach 不 unlink，本版本尚未实现）。
-  for (u32 I = 0; I < NumCores; I++) {
-    char ShmName[64];
-    snprintf(ShmName, sizeof(ShmName), "/scudo_arena_%u", I);
-    shm_unlink(ShmName);
+  //
+  // 但在独立进程共享场景下，我们需要支持后续进程「attach」复用已有
+  // 的 arena 状态；因此允许通过环境变量跳过 unlink：
+  //   SCUDO_SHARED_ARENA_ATTACH=1
+  if (!sharedArenaAttachEnabled()) {
+    for (u32 I = 0; I < NumCores; I++) {
+      char ShmName[64];
+      snprintf(ShmName, sizeof(ShmName), "/scudo_arena_%u", I);
+      shm_unlink(ShmName);
+    }
   }
 
   // 为每个 CPU 核心初始化一个 Arena。

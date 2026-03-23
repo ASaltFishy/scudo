@@ -841,12 +841,12 @@ void *MapAllocator<Config>::allocate(const Options &Options, uptr Size,
 
 #if SCUDO_LINUX
   // 内存压力水位线机制（DESIGN.md §2.1）：
-  // Arena 替代 MapAllocatorCache，仅接管 Cache 能处理的尺寸范围。
-  // 超过 Cache MaxEntrySize 的分配仍走 mmap 路径（deallocate 时 unmap）。
+  // 当激活 Arena 时，先尝试从 Arena 分配；若 Arena 无可用块再回退。
+  // 这样即使请求尺寸超过 Cache MaxEntrySize，也会先尝试 Arena，
+  // 仅在 Arena 失败时再走后续 cache/mmap 路径。
   {
     SharedArenaPool &Pool = SharedArenaPool::getInstance();
-    if (Pool.shouldUseArena() && Alignment < PageSize &&
-        Cache.canCache(MinNeededSizeForCache)) {
+    if (Pool.shouldUseArena() && Alignment < PageSize) {
       void *Ptr = tryAllocateFromArena(Options, Size, Alignment, BlockEndPtr,
                                        FillContents);
       if (Ptr != nullptr)
