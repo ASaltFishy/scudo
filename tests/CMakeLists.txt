@@ -84,6 +84,33 @@ macro(add_scudo_unittest testname)
   endforeach()
 endmacro()
 
+# Standalone benchmark binary (no gtest). See shared_arena_latency_bench.cpp / TEST.md.
+macro(add_scudo_bench testname)
+  cmake_parse_arguments(BENCH "" "" "SOURCES;ADDITIONAL_RTOBJECTS" ${ARGN})
+  if (COMPILER_RT_HAS_GWP_ASAN)
+    list(APPEND BENCH_ADDITIONAL_RTOBJECTS
+         RTGwpAsan RTGwpAsanBacktraceLibc RTGwpAsanSegvHandler)
+  endif()
+
+  foreach(arch ${SCUDO_TEST_ARCH})
+    set(SCUDO_BENCH_RTOBJECTS $<TARGET_OBJECTS:RTScudoStandalone.${arch}>)
+    foreach(rtobject ${BENCH_ADDITIONAL_RTOBJECTS})
+      list(APPEND SCUDO_BENCH_RTOBJECTS $<TARGET_OBJECTS:${rtobject}.${arch}>)
+    endforeach()
+    set(RUNTIME RT${testname}.${arch})
+    add_library(${RUNTIME} STATIC ${SCUDO_BENCH_RTOBJECTS})
+    set(ScudoBenchObjects)
+    generate_compiler_rt_tests(ScudoBenchObjects ScudoUnitTests
+      "${testname}-${arch}-Test" ${arch}
+      SOURCES ${BENCH_SOURCES}
+      COMPILE_DEPS ${SCUDO_TEST_HEADERS}
+      DEPS scudo_standalone
+      RUNTIME ${RUNTIME}
+      CFLAGS ${SCUDO_UNITTEST_CFLAGS}
+      LINK_FLAGS ${SCUDO_UNITTEST_LINK_FLAGS})
+  endforeach()
+endmacro()
+
 set(SCUDO_UNIT_TEST_SOURCES
   allocator_config_test.cpp
   atomic_test.cpp
@@ -138,3 +165,15 @@ set(SCUDO_CXX_UNIT_TEST_SOURCES
 add_scudo_unittest(ScudoCxxUnitTest
   SOURCES ${SCUDO_CXX_UNIT_TEST_SOURCES}
   ADDITIONAL_RTOBJECTS RTScudoStandaloneCWrappers RTScudoStandaloneCxxWrappers)
+
+add_scudo_bench(ScudoSharedArenaLatencyBench
+  SOURCES shared_arena_latency_bench.cpp)
+
+# 稳定目标名，避免猜 <arch>：ninja / cmake --build ... --target scudo-shared-arena-latency-bench
+set(_scudo_latency_bench_targets)
+foreach(_arch ${SCUDO_TEST_ARCH})
+  list(APPEND _scudo_latency_bench_targets
+       TScudoSharedArenaLatencyBench-${_arch}-Test)
+endforeach()
+add_custom_target(scudo-shared-arena-latency-bench
+  DEPENDS ${_scudo_latency_bench_targets})
