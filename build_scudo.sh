@@ -88,7 +88,17 @@ if [ "$TEST_MODE" != "none" ]; then
     )
     TEST_BIN="./tests/scudo_secondary_tests"
   else
-    TEST_SOURCES=(./tests/*.cpp)
+    # In full mode, we should not compile standalone benchmarks that carry
+    # their own main() (e.g. shared_arena_latency_bench.cpp) into gtests.
+    # Exclude any "*bench*.cpp" from gtest compilation.
+    TEST_SOURCES=()
+    for test_src in ./tests/*.cpp; do
+      base="$(basename "${test_src}")"
+      case "${base}" in
+        *bench*.cpp) continue ;;
+      esac
+      TEST_SOURCES+=("${test_src}")
+    done
     TEST_BIN="./tests/scudo_tests"
   fi
 

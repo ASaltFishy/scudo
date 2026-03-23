@@ -207,10 +207,11 @@ private:
 // ---------------------------------------------------------------------------
 class SharedArenaPool {
 public:
-  static SharedArenaPool &getInstance() {
-    static SharedArenaPool Pool;
-    return Pool;
-  }
+  static SharedArenaPool &getInstance();
+
+  // Allow constructing the global singleton instance in shared_arena_linux.cpp.
+  // External code should still prefer getInstance().
+  SharedArenaPool() = default;
 
   // 初始化所有核心的 Arena（幂等，多次调用安全）。
   // 应在分配器首次使用前调用（例如在 Allocator::init() 中）。
@@ -251,8 +252,6 @@ public:
   }
 
 private:
-  SharedArenaPool() = default;
-
   // 检测当前系统内存压力是否超过水位线（读取 /proc/meminfo）。
   bool checkMemoryPressure();
 
@@ -271,6 +270,8 @@ private:
 //  - SCUDO_SHARED_ARENA_FORCE=1: 测试时强制走共享 Arena 路径。
 //  - SCUDO_SHARED_ARENA_TRACE=1: 输出共享 Arena 关键路径日志。
 bool sharedArenaForceEnabled();
+void setSharedArenaForceForTesting(bool Enabled);
+void clearSharedArenaForceForTesting();
 bool sharedArenaTraceEnabled();
 void sharedArenaTrace(const char *Format, ...);
 
