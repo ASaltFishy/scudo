@@ -12,7 +12,7 @@
 2.1 核心架构：每核共享预映射内存池 (Per-Core Shared Arena)
 我们将原本属于单个进程的 MapAllocatorCache 升级为跨进程共享的更大 MapAllocatorPool。
 - 物理内存池化：为系统的每一个 CPU 核心维护一个全局共享的内存池（Arena）。使用每核心存储（Per-CPU Storage）保存该内存池的 head 指针。在secondary分配大页面时，直接从这个Pool中分配。初始化时，每个进程都通过shared memory接口map好arena，当系统内存压力达到一个水位线后，分配器开始放弃原本的MapAllocatorCache路径，转为直接在MapAllocatorPool上进行分配，后续物理内存通过实际访问时的page fault获得。
-- 统一虚拟地址预留：为了解决不同进程获取到的内存块在虚拟地址上不连续的问题，在每个进程的虚拟地址空间中，预先划分出一段足够大且固定大小（arena_size 作为全局常量）的连续虚拟地址区间，专门用于映射这些 Arena。实现上，先通过按需分配页面的方式创建shared memory，虚拟地址vma在此时生效，分配时走pagefault方式生成页面。
+- 统一虚拟地址预留：为了解决不同进程获取到的内存块在虚拟地址上不连续的问题，在每个进程的虚拟地址空间中，预先划分出一段足够大且固定大小（arena_size 作为全局常量）的连续虚拟地址区间，专门用于映射这些 Arena。实现上，先通过按需分配页面的方式创建shared memory，虚拟地址vma在此时生效，分配时走pagefault方式生成页面。**固定 VA 的核心要求是不变的，但具体基址需要按平台地址空间能力选取：桌面 Linux 可使用 32TB 附近空洞区域；Android 真机常见 39-bit 用户态 VA（约 512GB）时，应改用更低的固定窗口，或由 creator 在启动时探测并统一发布。**
 - 缓存交接：当进程的 Secondary 分配器释放大块内存时，不再私有化成为 MapAllocatorCache，而是直接加入当前执行核心对应的 Arena 中，供其他进程借用。若 Arena 暂存的数据量超过 arena_size，则直接调用 unmap 交还给内核。
 
 2.2 分配机制：无锁化快速投机分配

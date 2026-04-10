@@ -6,10 +6,13 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Linux 平台的共享内存池实现。
+// Linux/Android 平台的共享内存池实现。
 //
 // 核心机制：
-//  1. 使用 shm_open("/scudo_arena_N") 创建具名共享内存，任意进程均可按名打开。
+//  1. Linux 使用 shm_open("/scudo_arena_N") 创建具名共享内存，任意进程均可
+//     按名打开。
+//     Android 使用 memfd / ASharedMemory 创建 backing fd，并通过父进程
+//     继承 fd 让后续 exec 进程 attach。
 //  2. 用 MAP_SHARED | MAP_FIXED_NOREPLACE 将共享内存映射到固定 VA，使所有进程
 //     的同一 Arena 虚拟地址完全一致，实现池中块的零拷贝跨进程复用。
 //  3. 跨进程锁通过 futex(FUTEX_WAIT/WAKE) 实现，锁字段 (Hdr->Lock) 直接驻留
@@ -36,6 +39,7 @@
 #include <fcntl.h>
 #include <linux/futex.h>
 #include <linux/rseq.h>
+#include <limits.h>
 #include <sched.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -43,9 +47,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/un.h>
 #include <unistd.h>
+
+#if SCUDO_ANDROID
+#if defined(__has_include)
+#if __has_include(<android/sharedmem.h>)
+#include <android/sharedmem.h>
+#define SCUDO_SHARED_ARENA_HAS_ASHAREDMEM 1
+#endif
+#endif
+#ifndef SCUDO_SHARED_ARENA_HAS_ASHAREDMEM
+#define SCUDO_SHARED_ARENA_HAS_ASHAREDMEM 0
+#endif
+#endif
 
 // glibc 2.35+ 自动为每个线程注册 rseq，并导出以下符号。
 // 使用 weak 引用，在老版本 glibc 上优雅回退到 sched_getcpu()。
@@ -114,6 +132,501 @@ static bool sharedArenaAttachEnabled() {
   initSharedArenaEnvCacheOnce();
   return atomic_load(&SharedArenaEnvAttach, memory_order_relaxed) != 0u;
 }
+
+#if SCUDO_ANDROID
+// Android 通过两阶段协议完成无关进程 attach：
+//   1. CREATING：单一 creator 进程持有 creator lock，并创建全部 arena backing。
+//   2. READY：creator 启动 broker，对外按名字分发 arena fd；其他进程仅 attach。
+//
+// 这样可以避免“多个进程同时发现 broker 不存在，然后各自创建不同 backing”
+// 的竞态。
+static constexpr char kSharedArenaBrokerName[] = "scudo_shared_arena_broker";
+static constexpr char kSharedArenaCreatorName[] = "scudo_shared_arena_creator";
+static constexpr u32 kSharedArenaBrokerMagic = 0x5341524EU; // "SARN"
+static constexpr u32 kSharedArenaInitRetryCount = 5000;
+static constexpr useconds_t kSharedArenaInitRetrySleepUs = 1000;
+
+enum class SharedArenaAndroidInitMode : u8 {
+  Unknown = 0,
+  Create  = 1,
+  Attach  = 2,
+};
+
+static SharedArenaAndroidInitMode SharedArenaInitMode =
+    SharedArenaAndroidInitMode::Unknown;
+static int SharedArenaCreatorLockFd = -1;
+static atomic_u32 SharedArenaDebugCount = {};
+
+static void sharedArenaDebugPrint(const char *Format, ...) {
+  const u32 Count =
+      atomic_fetch_add(&SharedArenaDebugCount, 1u, memory_order_relaxed);
+  if (Count >= 128)
+    return;
+
+  char Buffer[512];
+  int PrefixLen =
+      snprintf(Buffer, sizeof(Buffer), "[scudo][shared_arena][android-debug] ");
+  if (PrefixLen < 0 || static_cast<size_t>(PrefixLen) >= sizeof(Buffer))
+    return;
+
+  va_list Args;
+  va_start(Args, Format);
+  int BodyLen = vsnprintf(Buffer + PrefixLen,
+                          sizeof(Buffer) - static_cast<size_t>(PrefixLen),
+                          Format, Args);
+  va_end(Args);
+  if (BodyLen < 0)
+    return;
+
+  size_t TotalLen =
+      Min(sizeof(Buffer) - 1, static_cast<size_t>(PrefixLen + BodyLen));
+  if (TotalLen == 0 || Buffer[TotalLen - 1] != '\n')
+    Buffer[TotalLen++] = '\n';
+  write(STDERR_FILENO, Buffer, TotalLen);
+}
+
+struct SharedArenaBrokerRequest {
+  u32 Magic;
+  u32 CoreId;
+};
+
+struct SharedArenaBrokerReply {
+  s32 Status;
+  u32 Reserved;
+};
+
+static void sharedArenaBrokerSockaddr(sockaddr_un &Addr, socklen_t &AddrLen) {
+  memset(&Addr, 0, sizeof(Addr));
+  Addr.sun_family = AF_UNIX;
+  Addr.sun_path[0] = '\0';
+  memcpy(Addr.sun_path + 1, kSharedArenaBrokerName,
+         sizeof(kSharedArenaBrokerName) - 1);
+  AddrLen = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 +
+                                   sizeof(kSharedArenaBrokerName) - 1);
+}
+
+static void sharedArenaCreatorSockaddr(sockaddr_un &Addr, socklen_t &AddrLen) {
+  memset(&Addr, 0, sizeof(Addr));
+  Addr.sun_family = AF_UNIX;
+  Addr.sun_path[0] = '\0';
+  memcpy(Addr.sun_path + 1, kSharedArenaCreatorName,
+         sizeof(kSharedArenaCreatorName) - 1);
+  AddrLen = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 +
+                                   sizeof(kSharedArenaCreatorName) - 1);
+}
+
+static bool sharedArenaWriteExact(int Fd, const void *Buf, size_t Size) {
+  const char *P = reinterpret_cast<const char *>(Buf);
+  while (Size != 0) {
+    const ssize_t N = write(Fd, P, Size);
+    if (N < 0) {
+      if (errno == EINTR)
+        continue;
+      return false;
+    }
+    if (N == 0)
+      return false;
+    P += N;
+    Size -= static_cast<size_t>(N);
+  }
+  return true;
+}
+
+static bool sharedArenaReadExact(int Fd, void *Buf, size_t Size) {
+  char *P = reinterpret_cast<char *>(Buf);
+  while (Size != 0) {
+    const ssize_t N = read(Fd, P, Size);
+    if (N < 0) {
+      if (errno == EINTR)
+        continue;
+      return false;
+    }
+    if (N == 0)
+      return false;
+    P += N;
+    Size -= static_cast<size_t>(N);
+  }
+  return true;
+}
+
+static int sharedArenaConnectBroker() {
+  const int Sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (Sock < 0) {
+    sharedArenaTrace("broker connect socket failed errno=%d", errno);
+    sharedArenaDebugPrint("broker connect socket failed errno=%d", errno);
+    return -1;
+  }
+
+  sockaddr_un Addr;
+  socklen_t AddrLen;
+  sharedArenaBrokerSockaddr(Addr, AddrLen);
+  if (connect(Sock, reinterpret_cast<sockaddr *>(&Addr), AddrLen) != 0) {
+    sharedArenaTrace("broker connect failed errno=%d", errno);
+    sharedArenaDebugPrint("broker connect failed errno=%d", errno);
+    close(Sock);
+    return -1;
+  }
+  return Sock;
+}
+
+static bool sharedArenaBrokerAvailable() {
+  const int Sock = sharedArenaConnectBroker();
+  if (Sock < 0)
+    return false;
+  close(Sock);
+  return true;
+}
+
+static int sharedArenaTryAcquireCreatorLock() {
+  const int Sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (Sock < 0) {
+    sharedArenaTrace("creator lock socket failed errno=%d", errno);
+    sharedArenaDebugPrint("creator lock socket failed errno=%d", errno);
+    return -1;
+  }
+
+  sockaddr_un Addr;
+  socklen_t AddrLen;
+  sharedArenaCreatorSockaddr(Addr, AddrLen);
+  if (bind(Sock, reinterpret_cast<sockaddr *>(&Addr), AddrLen) == 0) {
+    sharedArenaTrace("creator lock acquired");
+    sharedArenaDebugPrint("creator lock acquired");
+    return Sock;
+  }
+
+  const int SavedErrno = errno;
+  sharedArenaTrace("creator lock bind failed errno=%d", SavedErrno);
+  sharedArenaDebugPrint("creator lock bind failed errno=%d", SavedErrno);
+  close(Sock);
+  errno = SavedErrno;
+  return -1;
+}
+
+static void sharedArenaReleaseCreatorLock() {
+  if (SharedArenaCreatorLockFd >= 0) {
+    close(SharedArenaCreatorLockFd);
+    SharedArenaCreatorLockFd = -1;
+  }
+}
+
+static bool sharedArenaSelectAndroidInitMode() {
+  if (sharedArenaAttachEnabled()) {
+    SharedArenaInitMode = SharedArenaAndroidInitMode::Attach;
+    sharedArenaTrace("android init mode=attach (env)");
+      sharedArenaDebugPrint("android init mode=attach (env)");
+    return true;
+  }
+
+  for (u32 Attempt = 0; Attempt < kSharedArenaInitRetryCount; ++Attempt) {
+    if (sharedArenaBrokerAvailable()) {
+      SharedArenaInitMode = SharedArenaAndroidInitMode::Attach;
+      sharedArenaTrace("android init mode=attach (broker ready)");
+      sharedArenaDebugPrint("android init mode=attach (broker ready)");
+      return true;
+    }
+
+    const int CreatorFd = sharedArenaTryAcquireCreatorLock();
+    if (CreatorFd >= 0) {
+      SharedArenaCreatorLockFd = CreatorFd;
+      SharedArenaInitMode = SharedArenaAndroidInitMode::Create;
+      sharedArenaTrace("android init mode=create");
+      sharedArenaDebugPrint("android init mode=create");
+      return true;
+    }
+
+    if (errno != EADDRINUSE) {
+      sharedArenaTrace("android init mode select failed errno=%d", errno);
+      sharedArenaDebugPrint("android init mode select failed errno=%d", errno);
+      return false;
+    }
+
+    usleep(kSharedArenaInitRetrySleepUs);
+  }
+
+  sharedArenaTrace("android init mode select timed out waiting for broker");
+  sharedArenaDebugPrint("android init mode select timed out waiting for broker");
+  return false;
+}
+
+static bool sharedArenaSendBrokerReply(int Sock, int Status, int FdToSend) {
+  SharedArenaBrokerReply Reply = {};
+  Reply.Status = Status;
+
+  iovec Iov = {};
+  Iov.iov_base = &Reply;
+  Iov.iov_len = sizeof(Reply);
+
+  alignas(struct cmsghdr) char Control[CMSG_SPACE(sizeof(int))];
+  memset(Control, 0, sizeof(Control));
+
+  msghdr Msg = {};
+  Msg.msg_iov = &Iov;
+  Msg.msg_iovlen = 1;
+  if (FdToSend >= 0) {
+    Msg.msg_control = Control;
+    Msg.msg_controllen = sizeof(Control);
+    cmsghdr *Cmsg = CMSG_FIRSTHDR(&Msg);
+    Cmsg->cmsg_level = SOL_SOCKET;
+    Cmsg->cmsg_type = SCM_RIGHTS;
+    Cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    *reinterpret_cast<int *>(CMSG_DATA(Cmsg)) = FdToSend;
+    Msg.msg_controllen = Cmsg->cmsg_len;
+  }
+
+  while (sendmsg(Sock, &Msg, MSG_NOSIGNAL) < 0) {
+    if (errno == EINTR)
+      continue;
+    return false;
+  }
+  return true;
+}
+
+static int sharedArenaRequestBrokerFd(u32 CoreId) {
+  const int Sock = sharedArenaConnectBroker();
+  if (Sock < 0) {
+    sharedArenaTrace("request broker fd core=%u connect failed", CoreId);
+    sharedArenaDebugPrint("request broker fd core=%u connect failed", CoreId);
+    return -1;
+  }
+
+  SharedArenaBrokerRequest Request = {};
+  Request.Magic = kSharedArenaBrokerMagic;
+  Request.CoreId = CoreId;
+  if (!sharedArenaWriteExact(Sock, &Request, sizeof(Request))) {
+    sharedArenaTrace("request broker fd core=%u write failed errno=%d", CoreId,
+                     errno);
+    sharedArenaDebugPrint("request broker fd core=%u write failed errno=%d",
+                          CoreId, errno);
+    close(Sock);
+    return -1;
+  }
+
+  SharedArenaBrokerReply Reply = {};
+  iovec Iov = {};
+  Iov.iov_base = &Reply;
+  Iov.iov_len = sizeof(Reply);
+
+  alignas(struct cmsghdr) char Control[CMSG_SPACE(sizeof(int))];
+  memset(Control, 0, sizeof(Control));
+
+  msghdr Msg = {};
+  Msg.msg_iov = &Iov;
+  Msg.msg_iovlen = 1;
+  Msg.msg_control = Control;
+  Msg.msg_controllen = sizeof(Control);
+
+  ssize_t N;
+  do {
+    N = recvmsg(Sock, &Msg, 0);
+  } while (N < 0 && errno == EINTR);
+
+  int ReceivedFd = -1;
+  if (N == static_cast<ssize_t>(sizeof(Reply)) && Reply.Status == 0) {
+    for (cmsghdr *Cmsg = CMSG_FIRSTHDR(&Msg); Cmsg != nullptr;
+         Cmsg = CMSG_NXTHDR(&Msg, Cmsg)) {
+      if (Cmsg->cmsg_level == SOL_SOCKET && Cmsg->cmsg_type == SCM_RIGHTS &&
+          Cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
+        ReceivedFd = *reinterpret_cast<int *>(CMSG_DATA(Cmsg));
+        break;
+      }
+    }
+  }
+
+  if (ReceivedFd < 0)
+    sharedArenaTrace("request broker fd core=%u failed status=%d recv=%zd errno=%d",
+                     CoreId, Reply.Status, N, errno);
+  else
+    sharedArenaTrace("request broker fd core=%u success fd=%d", CoreId,
+                     ReceivedFd);
+  if (ReceivedFd < 0)
+    sharedArenaDebugPrint(
+        "request broker fd core=%u failed status=%d recv=%zd errno=%d", CoreId,
+        Reply.Status, N, errno);
+  else
+    sharedArenaDebugPrint("request broker fd core=%u success fd=%d", CoreId,
+                          ReceivedFd);
+  close(Sock);
+  return ReceivedFd;
+}
+
+static void sharedArenaFdEnvName(u32 CoreId, char *Buf, size_t BufSize) {
+  snprintf(Buf, BufSize, "SCUDO_SHARED_ARENA_FD_%u", CoreId);
+}
+
+static bool sharedArenaGetInheritedFd(u32 CoreId, int &OutFd) {
+  char Name[64];
+  sharedArenaFdEnvName(CoreId, Name, sizeof(Name));
+  const char *Value = getenv(Name);
+  if (Value == nullptr || Value[0] == '\0')
+    return false;
+
+  char *End = nullptr;
+  errno = 0;
+  const long Parsed = strtol(Value, &End, 10);
+  if (errno != 0 || End == Value || (End != nullptr && *End != '\0') ||
+      Parsed < 0 || Parsed > INT_MAX) {
+    return false;
+  }
+
+  const int Fd = static_cast<int>(Parsed);
+  if (fcntl(Fd, F_GETFD) < 0)
+    return false;
+
+  OutFd = Fd;
+  return true;
+}
+
+static bool sharedArenaExportFd(u32 CoreId, int Fd) {
+#if SCUDO_ANDROID
+  char Name[64];
+  char Value[32];
+  sharedArenaFdEnvName(CoreId, Name, sizeof(Name));
+  snprintf(Value, sizeof(Value), "%d", Fd);
+  return setenv(Name, Value, 1) == 0;
+#else
+  (void)CoreId;
+  (void)Fd;
+  return true;
+#endif
+}
+
+static bool sharedArenaClearCloseOnExec(int Fd) {
+  const int Flags = fcntl(Fd, F_GETFD);
+  if (Flags < 0)
+    return false;
+  if ((Flags & FD_CLOEXEC) == 0)
+    return true;
+  return fcntl(Fd, F_SETFD, Flags & ~FD_CLOEXEC) == 0;
+}
+
+static int sharedArenaCreateAndroidBacking(u32 CoreId) {
+  char Name[64];
+  snprintf(Name, sizeof(Name), "scudo_arena_%u", CoreId);
+
+#if defined(SYS_memfd_create)
+  int Fd = static_cast<int>(syscall(SYS_memfd_create, Name, 0));
+  if (Fd >= 0) {
+    if (ftruncate(Fd, static_cast<off_t>(kArenaCapacityPerCore)) == 0) {
+      sharedArenaTrace("create backing core=%u via memfd fd=%d", CoreId, Fd);
+      sharedArenaDebugPrint("create backing core=%u via memfd fd=%d", CoreId,
+                            Fd);
+      return Fd;
+    }
+    sharedArenaTrace("create backing core=%u memfd ftruncate failed errno=%d",
+                     CoreId, errno);
+    sharedArenaDebugPrint(
+        "create backing core=%u memfd ftruncate failed errno=%d", CoreId,
+        errno);
+    close(Fd);
+    return -1;
+  }
+  sharedArenaTrace("create backing core=%u memfd_create failed errno=%d", CoreId,
+                   errno);
+  sharedArenaDebugPrint("create backing core=%u memfd_create failed errno=%d",
+                        CoreId, errno);
+#endif
+
+#if SCUDO_SHARED_ARENA_HAS_ASHAREDMEM
+  const int AshmemFd =
+      ASharedMemory_create(Name, static_cast<size_t>(kArenaCapacityPerCore));
+  sharedArenaTrace("create backing core=%u via ASharedMemory fd=%d errno=%d",
+                   CoreId, AshmemFd, errno);
+  sharedArenaDebugPrint("create backing core=%u via ASharedMemory fd=%d errno=%d",
+                        CoreId, AshmemFd, errno);
+  return AshmemFd;
+#else
+  (void)Name;
+  sharedArenaTrace("create backing core=%u unavailable: no memfd/ASharedMemory",
+                   CoreId);
+  sharedArenaDebugPrint(
+      "create backing core=%u unavailable: no memfd/ASharedMemory", CoreId);
+  return -1;
+#endif
+}
+
+static void sharedArenaBrokerLoop(u32 NumCores, const SharedArena *Arenas) {
+  const int ListenFd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (ListenFd < 0) {
+    sharedArenaTrace("broker loop socket failed errno=%d", errno);
+    sharedArenaDebugPrint("broker loop socket failed errno=%d", errno);
+    _exit(1);
+  }
+
+  sockaddr_un Addr;
+  socklen_t AddrLen;
+  sharedArenaBrokerSockaddr(Addr, AddrLen);
+  if (bind(ListenFd, reinterpret_cast<sockaddr *>(&Addr), AddrLen) != 0) {
+    sharedArenaTrace("broker loop bind failed errno=%d", errno);
+    sharedArenaDebugPrint("broker loop bind failed errno=%d", errno);
+    close(ListenFd);
+    _exit(errno == EADDRINUSE ? 0 : 1);
+  }
+  if (listen(ListenFd, 4) != 0) {
+    sharedArenaTrace("broker loop listen failed errno=%d", errno);
+    sharedArenaDebugPrint("broker loop listen failed errno=%d", errno);
+    close(ListenFd);
+    _exit(1);
+  }
+  sharedArenaTrace("broker loop ready num_cores=%u", NumCores);
+  sharedArenaDebugPrint("broker loop ready num_cores=%u", NumCores);
+
+  for (;;) {
+    const int Client = accept4(ListenFd, nullptr, nullptr, SOCK_CLOEXEC);
+    if (Client < 0) {
+      if (errno == EINTR)
+        continue;
+      break;
+    }
+
+    SharedArenaBrokerRequest Request = {};
+    if (!sharedArenaReadExact(Client, &Request, sizeof(Request))) {
+      close(Client);
+      continue;
+    }
+
+    if (Request.Magic != kSharedArenaBrokerMagic ||
+        Request.CoreId >= NumCores) {
+      (void)sharedArenaSendBrokerReply(Client, -1, -1);
+      close(Client);
+      continue;
+    }
+
+    const int ArenaFd = Arenas[Request.CoreId].getShmFd();
+    sharedArenaTrace("broker serve core=%u fd=%d", Request.CoreId, ArenaFd);
+    sharedArenaDebugPrint("broker serve core=%u fd=%d", Request.CoreId, ArenaFd);
+    (void)sharedArenaSendBrokerReply(Client, ArenaFd >= 0 ? 0 : -1, ArenaFd);
+    close(Client);
+  }
+
+  close(ListenFd);
+  _exit(1);
+}
+
+static bool sharedArenaStartBroker(u32 NumCores, const SharedArena *Arenas) {
+  const pid_t Pid = fork();
+  if (Pid < 0) {
+    sharedArenaTrace("start broker fork failed errno=%d", errno);
+    sharedArenaDebugPrint("start broker fork failed errno=%d", errno);
+    return false;
+  }
+  if (Pid == 0) {
+    (void)setsid();
+    sharedArenaBrokerLoop(NumCores, Arenas);
+    _exit(1);
+  }
+  sharedArenaTrace("start broker pid=%d", Pid);
+  sharedArenaDebugPrint("start broker pid=%d", Pid);
+
+  for (u32 Attempt = 0; Attempt < 50; ++Attempt) {
+    if (sharedArenaBrokerAvailable())
+      return true;
+    usleep(1000);
+  }
+  sharedArenaTrace("start broker timeout waiting ready");
+  sharedArenaDebugPrint("start broker timeout waiting ready");
+  return false;
+}
+#endif
 
 bool sharedArenaForceEnabled() {
   initSharedArenaEnvCacheOnce();
@@ -239,10 +752,45 @@ bool SharedArena::init(u32 Id) {
   BaseAddr = kSharedArenaBaseAddr + static_cast<uptr>(Id) * kArenaCapacityPerCore;
   DataBase = BaseAddr + kArenaHeaderSize;
 
+  int Fd = -1;
+#if SCUDO_ANDROID
+  switch (SharedArenaInitMode) {
+  case SharedArenaAndroidInitMode::Attach:
+    if (!sharedArenaGetInheritedFd(Id, Fd))
+      Fd = sharedArenaRequestBrokerFd(Id);
+    if (Fd < 0) {
+      sharedArenaTrace("arena init core=%u attach failed", Id);
+      sharedArenaDebugPrint("arena init core=%u attach failed", Id);
+      return false;
+    }
+    break;
+  case SharedArenaAndroidInitMode::Create:
+    Fd = sharedArenaCreateAndroidBacking(Id);
+    if (Fd < 0) {
+      sharedArenaTrace("arena init core=%u create backing failed", Id);
+      sharedArenaDebugPrint("arena init core=%u create backing failed", Id);
+      return false;
+    }
+    if (!sharedArenaClearCloseOnExec(Fd) || !sharedArenaExportFd(Id, Fd)) {
+      sharedArenaTrace("arena init core=%u export fd failed errno=%d", Id,
+                       errno);
+      sharedArenaDebugPrint("arena init core=%u export fd failed errno=%d", Id,
+                            errno);
+      close(Fd);
+      return false;
+    }
+    break;
+  case SharedArenaAndroidInitMode::Unknown:
+  default:
+    sharedArenaTrace("arena init core=%u unknown init mode", Id);
+    sharedArenaDebugPrint("arena init core=%u unknown init mode", Id);
+    return false;
+  }
+#else
   char ShmName[64];
   snprintf(ShmName, sizeof(ShmName), "/scudo_arena_%u", Id);
 
-  int Fd = shm_open(ShmName, O_CREAT | O_RDWR, 0600);
+  Fd = shm_open(ShmName, O_CREAT | O_RDWR, 0600);
   if (Fd < 0)
     return false;
 
@@ -250,11 +798,16 @@ bool SharedArena::init(u32 Id) {
     close(Fd);
     return false;
   }
+#endif
 
   void *P = mmap(reinterpret_cast<void *>(BaseAddr), kArenaCapacityPerCore,
                  PROT_READ | PROT_WRITE,
                  MAP_SHARED | MAP_FIXED_NOREPLACE | MAP_NORESERVE, Fd, 0);
   if (P == MAP_FAILED) {
+    sharedArenaTrace("arena init core=%u mmap failed base=0x%zx errno=%d", Id,
+                     BaseAddr, errno);
+    sharedArenaDebugPrint("arena init core=%u mmap failed base=0x%zx errno=%d",
+                          Id, BaseAddr, errno);
     close(Fd);
     return false;
   }
@@ -286,7 +839,34 @@ bool SharedArena::init(u32 Id) {
   }
 
   Initialized = true;
+  sharedArenaTrace("arena init core=%u success base=0x%zx fd=%d", Id, BaseAddr,
+                   Fd);
+  sharedArenaDebugPrint("arena init core=%u success base=0x%zx fd=%d", Id,
+                        BaseAddr, Fd);
   return true;
+}
+
+void SharedArena::reset() {
+  if (UNLIKELY(!Initialized || Hdr == nullptr))
+    return;
+
+  const uptr PageSize = getPageSizeCached();
+  const u32 TotalDataPages =
+      static_cast<u32>((kArenaCapacityPerCore - kArenaHeaderSize) / PageSize);
+
+  lock();
+  Hdr->BumpOffsetInPages   = 0;
+  Hdr->TotalDataPages      = TotalDataPages;
+  Hdr->FreeListHeadPageOff = kFreeListEnd;
+  Hdr->FreeCount           = 0;
+  Hdr->TotalDonatedBytes   = 0;
+  Hdr->TotalRetrievedBytes = 0;
+  Hdr->DonateCount         = 0;
+  Hdr->RetrieveCount       = 0;
+  unlock();
+
+  const uptr DataSize = kArenaCapacityPerCore - kArenaHeaderSize;
+  (void)releasePages(DataBase, DataSize);
 }
 
 // ---------------------------------------------------------------------------
@@ -597,19 +1177,43 @@ void SharedArenaPool::init() NO_THREAD_SAFETY_ANALYSIS{
   if (NumCores > kArenaMaxCores)
     NumCores = kArenaMaxCores;
 
-  // 清理上一次进程会话遗留的共享内存。
+  bool ShouldCreateFreshBacking =
+#if SCUDO_ANDROID
+      false;
+#else
+      !sharedArenaAttachEnabled();
+#endif
+#if SCUDO_ANDROID
+  SharedArenaInitMode = SharedArenaAndroidInitMode::Unknown;
+  sharedArenaReleaseCreatorLock();
+  if (!sharedArenaSelectAndroidInitMode()) {
+    sharedArenaTrace("pool init failed selecting android init mode");
+    sharedArenaDebugPrint("pool init failed selecting android init mode");
+    Initialized = false;
+    return;
+  }
+  ShouldCreateFreshBacking =
+      SharedArenaInitMode == SharedArenaAndroidInitMode::Create;
+  sharedArenaTrace("pool init android mode=%u num_cores=%u",
+                   static_cast<unsigned>(SharedArenaInitMode), NumCores);
+  sharedArenaDebugPrint("pool init android mode=%u num_cores=%u",
+                        static_cast<unsigned>(SharedArenaInitMode), NumCores);
+#endif
+
+  // Linux: 清理上一次进程会话遗留的具名共享内存。
   // /dev/shm (tmpfs) 上的文件在进程退出后仍然存在，其中的元数据
   //（freelist head、entries 等）对应旧进程的状态，直接复用会导致崩溃。
   //
-  // 但在独立进程共享场景下，我们需要支持后续进程「attach」复用已有
-  // 的 arena 状态；因此允许通过环境变量跳过 unlink：
-  //   SCUDO_SHARED_ARENA_ATTACH=1
-  if (!sharedArenaAttachEnabled()) {
+  // Android: 只有拿到 creator lock、进入 CREATING 阶段的单一进程允许创建
+  // backing；其他进程在 READY 阶段只 attach 到 broker。
+  if (ShouldCreateFreshBacking) {
+#if !SCUDO_ANDROID
     for (u32 I = 0; I < NumCores; I++) {
       char ShmName[64];
       snprintf(ShmName, sizeof(ShmName), "/scudo_arena_%u", I);
       shm_unlink(ShmName);
     }
+#endif
   }
 
   // 为每个 CPU 核心初始化一个 Arena。
@@ -619,7 +1223,25 @@ void SharedArenaPool::init() NO_THREAD_SAFETY_ANALYSIS{
     if (!Arenas[I].init(I))
       allOk = false;
   }
+#if SCUDO_ANDROID
+  if (allOk && SharedArenaInitMode == SharedArenaAndroidInitMode::Create)
+    allOk = sharedArenaStartBroker(NumCores, Arenas);
+  sharedArenaReleaseCreatorLock();
+  if (!allOk)
+    SharedArenaInitMode = SharedArenaAndroidInitMode::Unknown;
+#endif
+  sharedArenaTrace("pool init finished ready=%d", allOk ? 1 : 0);
+  sharedArenaDebugPrint("pool init finished ready=%d", allOk ? 1 : 0);
   Initialized = allOk;
+}
+
+void SharedArenaPool::reset() {
+  if (!Initialized)
+    return;
+  for (u32 I = 0; I < NumCores; ++I) {
+    if (Arenas[I].isInitialized())
+      Arenas[I].reset();
+  }
 }
 
 // ---------------------------------------------------------------------------

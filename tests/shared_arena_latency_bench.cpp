@@ -42,8 +42,8 @@ template <typename Config> static Options getOptionsForConfig() {
   return AO.load();
 }
 
-using Config = DefaultConfig;
-using LargeAllocator = MapAllocator<SecondaryConfig<Config>>;
+using BenchConfig = DefaultConfig;
+using LargeAllocator = MapAllocator<SecondaryConfig<BenchConfig>>;
 
 static uint64_t nowNs() {
   return static_cast<uint64_t>(
@@ -59,7 +59,14 @@ static bool pinSelfToCpu(int Cpu) {
   CPU_SET(Cpu, &Set);
   // Use thread-level affinity so process-level affinity (used by
   // SharedArenaPool::getNumberOfCPUs via sched_getaffinity) stays stable.
+#if SCUDO_ANDROID
+  // Android bionic does not expose pthread_setaffinity_np consistently across
+  // API levels/toolchains; sched_setaffinity(0, ...) still pins the calling
+  // thread on Linux/Android.
+  return sched_setaffinity(0, sizeof(Set), &Set) == 0;
+#else
   return pthread_setaffinity_np(pthread_self(), sizeof(Set), &Set) == 0;
+#endif
 #else
   (void)Cpu;
   return false;
@@ -565,14 +572,15 @@ int main(int argc, char **argv) {
       setenv("SCUDO_SHARED_ARENA_FORCE", "0", 1);
     else
       unsetenv("SCUDO_SHARED_ARENA_FORCE");
-    unsetenv("SCUDO_SHARED_ARENA_TRACE");
+    if (!sharedArenaTraceEnabled())
+      unsetenv("SCUDO_SHARED_ARENA_TRACE");
 
     GlobalStats S;
     S.init();
     LargeAllocator Alloc;
     Alloc.init(&S);
 
-    Options Opt = getOptionsForConfig<SecondaryConfig<Config>>();
+    Options Opt = getOptionsForConfig<SecondaryConfig<BenchConfig>>();
 
       // Pin after Alloc.init so SharedArenaPool::init can compute NumCores from
       // the broader affinity mask (it uses sched_getaffinity(0,...)).
@@ -646,7 +654,7 @@ int main(int argc, char **argv) {
   if (!IndependentProcessMode)
     printAffinity("after pin");
 
-  Options Opt = getOptionsForConfig<SecondaryConfig<Config>>();
+  Options Opt = getOptionsForConfig<SecondaryConfig<BenchConfig>>();
 
   for (uptr Size : Sizes) {
     double HumanSize = 0.0;
@@ -704,6 +712,13 @@ int main(int argc, char **argv) {
         const u32 NumCores = Pool.getNumCores();
         const int BaseCpu = (PinCpu >= 0) ? PinCpu : 0;
 
+#if SCUDO_ANDROID
+        // Android 的 Arena backing 由当前父进程持有的 memfd / ASharedMemory fd
+        // 提供；独立 exec 子进程只能 attach 到这些已继承的 fd，因此每轮先在父
+        // 进程中 reset 共享状态，再让 donor / worker 全部走 attach-env=1。
+        Pool.reset();
+#endif
+
         std::vector<int> SeedCpus;
         SeedCpus.reserve(static_cast<size_t>(IndependentProcessCount));
         if (Delegated && NumCores > 0) {
@@ -732,10 +747,15 @@ int main(int argc, char **argv) {
           if (DonorPid == 0) {
             const int SeedCpu = SeedCpus[SeedIdx];
 
-            // Only the first donor uses attach-env=0 (creates/unlinks a clean arena).
-            // Remaining donors attach to the already-created arena state.
+            // Linux: first donor uses attach-env=0 to create a fresh named shm.
+            // Android: child must always attach to inherited backing fds; the
+            // parent process already reset the pool just before forking.
+#if SCUDO_ANDROID
+            const char *AttachEnv = "1";
+#else
             const char *AttachEnv =
                 (SeedIdx == 0) ? "0" : "1";
+#endif
 
             char DelegatedBuf[8];
             char ForceOffBuf[8];

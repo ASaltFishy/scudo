@@ -43,9 +43,14 @@ namespace scudo {
 // ---------------------------------------------------------------------------
 
 // 所有进程中 Arena 起始映射的固定虚拟地址。
-// 选取 32TB 附近的空洞区域，与典型 ASLR 布局冲突概率低。
-// 最终产品中可通过配置或内核保留区域机制确定。
-static constexpr uptr kSharedArenaBaseAddr = 0x200000000000ULL;
+// Linux 选取 32TB 附近的空洞区域，与典型 ASLR 布局冲突概率低。
+// Android 真机常见 39-bit 用户态 VA（512 GB），因此改用更低地址窗口。
+// 最终产品中可通过配置、broker 发布或内核保留区域机制确定。
+#if SCUDO_ANDROID
+static constexpr uptr kSharedArenaBaseAddr = 0x1000000000ULL; // 64 GB
+#else
+static constexpr uptr kSharedArenaBaseAddr = 0x200000000000ULL; // 32 TB
+#endif
 
 // 每个核心 Arena 的容量（256 MB）。
 static constexpr uptr kArenaCapacityPerCore = 256ULL * 1024 * 1024;
@@ -131,8 +136,10 @@ static_assert(sizeof(SharedArenaHeader) <= kArenaHeaderSize,
 class SharedArena {
 public:
   // 初始化 CoreId 号 Arena。
-  // 创建（或重新打开）POSIX 共享内存 "/scudo_arena_N"，
-  // 将其映射至固定 VA：kSharedArenaBaseAddr + CoreId * kArenaCapacityPerCore。
+  // Linux 使用（或重新打开）POSIX 共享内存 "/scudo_arena_N"；
+  // Android 使用 memfd / ASharedMemory，并通过继承 fd 的方式 attach。
+  // 两平台都会将共享内存映射至固定 VA：
+  // kSharedArenaBaseAddr + CoreId * kArenaCapacityPerCore。
   bool init(u32 CoreId);
 
   // 将一个块归还到 Arena（DESIGN.md §2.1 缓存交接 + §2.4 跨核迁移）。
@@ -173,6 +180,10 @@ public:
   // 统计信息（调试/测试用）。
   void getStats(uptr &OutFreeCount, uptr &OutDonatedBytes,
                 uptr &OutRetrievedBytes) const;
+
+  // 清空该 Arena 的共享状态，保留映射与 backing store 本身。
+  // 用于 benchmark 在同一父进程下多轮独立进程对比时重新开始。
+  void reset();
 
   int getShmFd() const { return ShmFd; }
 
@@ -216,6 +227,9 @@ public:
   // 初始化所有核心的 Arena（幂等，多次调用安全）。
   // 应在分配器首次使用前调用（例如在 Allocator::init() 中）。
   void init();
+
+  // 重置所有已初始化 Arena 的共享状态，保留已有映射和 backing fds。
+  void reset();
 
   // 共享内存池是否就绪。
   bool isReady() const { return Initialized; }
@@ -269,6 +283,9 @@ private:
 // 调试/测试辅助：
 //  - SCUDO_SHARED_ARENA_FORCE=1: 测试时强制走共享 Arena 路径。
 //  - SCUDO_SHARED_ARENA_TRACE=1: 输出共享 Arena 关键路径日志。
+//  - SCUDO_SHARED_ARENA_ATTACH=1:
+//      Linux: attach 到现有具名 shm。
+//      Android: attach 到父进程继承下来的 backing fd。
 bool sharedArenaForceEnabled();
 void setSharedArenaForceForTesting(bool Enabled);
 void clearSharedArenaForceForTesting();
