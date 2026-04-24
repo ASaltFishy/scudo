@@ -200,6 +200,14 @@ public:
 template <typename Config, void (*unmapCallBack)(MemMapT &) = unmap>
 class MapAllocatorCache {
 public:
+  void getRetrieveStats(u32 *OutCalls, u32 *OutHits) {
+    if (!OutCalls || !OutHits)
+      return;
+    ScopedLock L(Mutex);
+    *OutCalls = CallsToRetrieve;
+    *OutHits = SuccessfulRetrieves;
+  }
+
   void getStats(ScopedString *Str) {
     ScopedLock L(Mutex);
     uptr Integral;
@@ -662,6 +670,10 @@ public:
 
   void getStats(ScopedString *Str);
 
+  void getCacheRetrieveStats(u32 *OutCalls, u32 *OutHits) {
+    Cache.getRetrieveStats(OutCalls, OutHits);
+  }
+
 private:
   typename Config::template CacheT<typename Config::CacheConfig> Cache;
 
@@ -962,10 +974,15 @@ void MapAllocator<Config>::deallocate(const Options &Options, void *Ptr)
     if (Pool.isReady() && Pool.isArenaAddr(FullBase)) {
       SharedArena *Owner = Pool.getOwningArena(FullBase);
       if (LIKELY(Owner != nullptr)) {
-        Owner->store(FullBase, FullSize);
-        sharedArenaTrace("deallocate return core=%u ptr=0x%zx base=0x%zx size=%zu",
-                         Owner->getCoreId(), reinterpret_cast<uptr>(Ptr),
-                         FullBase, FullSize);
+        if (Owner->store(FullBase, FullSize)) {
+          sharedArenaTrace("deallocate return core=%u ptr=0x%zx base=0x%zx size=%zu",
+                           Owner->getCoreId(), reinterpret_cast<uptr>(Ptr),
+                           FullBase, FullSize);
+        } else {
+          sharedArenaTrace("deallocate skip-shared-return core=%u ptr=0x%zx base=0x%zx size=%zu",
+                           Owner->getCoreId(), reinterpret_cast<uptr>(Ptr),
+                           FullBase, FullSize);
+        }
       }
       return;
     }

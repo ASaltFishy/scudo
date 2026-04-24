@@ -17,3 +17,5 @@ settings.json
 .cursor/
 scudo_tests
 scudo_secondary_tests
+
+microbench-results/

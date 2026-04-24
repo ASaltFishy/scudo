@@ -12,13 +12,16 @@
 // Transitive includes of stdint.h specify some of the defines checked below.
 #include <stdint.h>
 
+#ifndef SCUDO_LINUX
 #if defined(__linux__) && !defined(__TRUSTY__)
 #define SCUDO_LINUX 1
 #else
 #define SCUDO_LINUX 0
 #endif
+#endif
 
 // See https://android.googlesource.com/platform/bionic/+/master/docs/defines.md
+#ifndef SCUDO_ANDROID
 #if defined(__BIONIC__)
 #define SCUDO_ANDROID 1
 // Transitive includes of unistd.h will get PAGE_SIZE if it is defined.
@@ -28,6 +31,7 @@
 #endif
 #else
 #define SCUDO_ANDROID 0
+#endif
 #endif
 
 #if defined(__Fuchsia__)

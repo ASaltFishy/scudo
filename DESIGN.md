@@ -12,7 +12,7 @@
 2.1 核心架构：每核共享预映射内存池 (Per-Core Shared Arena)
 我们将原本属于单个进程的 MapAllocatorCache 升级为跨进程共享的更大 MapAllocatorPool。
 - 物理内存池化：为系统的每一个 CPU 核心维护一个全局共享的内存池（Arena）。使用每核心存储（Per-CPU Storage）保存该内存池的 head 指针。在secondary分配大页面时，直接从这个Pool中分配。初始化时，每个进程都通过shared memory接口map好arena，当系统内存压力达到一个水位线后，分配器开始放弃原本的MapAllocatorCache路径，转为直接在MapAllocatorPool上进行分配，后续物理内存通过实际访问时的page fault获得。
-- 统一虚拟地址预留：为了解决不同进程获取到的内存块在虚拟地址上不连续的问题，在每个进程的虚拟地址空间中，预先划分出一段足够大且固定大小（arena_size 作为全局常量）的连续虚拟地址区间，专门用于映射这些 Arena。实现上，先通过按需分配页面的方式创建shared memory，虚拟地址vma在此时生效，分配时走pagefault方式生成页面。**固定 VA 的核心要求是不变的，但具体基址需要按平台地址空间能力选取：桌面 Linux 可使用 32TB 附近空洞区域；Android 真机常见 39-bit 用户态 VA（约 512GB）时，应改用更低的固定窗口，或由 creator 在启动时探测并统一发布。**
+- 统一虚拟地址预留：为了解决不同进程获取到的内存块在虚拟地址上不连续的问题，在每个进程的虚拟地址空间中，预先划分出一段足够大且固定大小（arena_size 作为全局常量）的连续虚拟地址区间，专门用于映射这些 Arena。实现上，先通过按需分配页面的方式创建shared memory，虚拟地址vma在此时生效，分配时走pagefault方式生成页面。
 - 缓存交接：当进程的 Secondary 分配器释放大块内存时，不再私有化成为 MapAllocatorCache，而是直接加入当前执行核心对应的 Arena 中，供其他进程借用。若 Arena 暂存的数据量超过 arena_size，则直接调用 unmap 交还给内核。
 
 2.2 分配机制：无锁化快速投机分配
@@ -26,12 +26,52 @@
 
 2.3 安全与隔离机制 (Security & Isolation) 
 内存委托必须确保空间隔离与原子性。我们在内核调度层引入协同：
-- Bitmap 追踪：分配器为每个 Arena 维护一个 Bitmap，精确记录池中每个页面当前被分配给了哪个进程（例如进程 A）。
-- 上下文切换时的强制解绑：当该核心发生上下文切换（例如从进程 A 切换到进程 B）时，内核拦截调度路径，检查该核心 Arena 的 Bitmap。内核会动态修改进程 B 的页表，取消其对“已被进程 A 拿走的内存块”的映射权限，从而避免应用越权访问或恶意篡改。
+- 内核独占归属表：分配器为每个 Arena 维护一份仅由内核修改的页面归属表 `page_slot[]`，以页为粒度记录当前页面属于哪个 owner slot；`owner_table` 再将 slot 映射到具体进程地址空间（`mm/tgid`）。其中空闲页用保留 slot 值表示。用户态不直接修改这份真值表，只能通过轻量化日志上报“分配/释放”意图。
+- Chunk 代际追踪：Arena 按固定大小分为多个 chunk（建议 64 页，即约 256KB），内核为每个 chunk 维护 `chunk_gen[u64]`。每次处理完一批用户态上报的分配/释放日志后，内核递增全局提交序号，并把受影响 chunk 的 `chunk_gen` 更新为最新代际号，用于标识该 chunk 自上次同步以来发生过映射变化。
+- 上下文切换时的强制解绑：当该核心发生上下文切换（例如从进程 A 切换到进程 B）时，内核拦截调度路径，先处理 `prev` 进程尚未提交的修改日志并更新 `page_slot[]/chunk_gen[]`，再结合 `next` 进程上次已同步的代际号，只检查发生变化的 chunk。内核据此修改 `next` 的页表，取消其对“已被其他进程拿走的内存块”的映射权限，从而避免应用越权访问或恶意篡改。
 
 2.4 边界场景处理：跨核与线程迁移
-- 并发访问：由于分配严格绑定在“当前执行核心”的 Arena 上，同一进程的不同线程若运行在不同核心，会分别访问各自核心的 Arena，天然避免了并发访问同一个 Free List 的锁竞争。
-- 线程跨核迁移：若线程从 Core 1 迁移到 Core 2，无需特殊回滚操作。其在 Core 1 申请的内存在使用完毕释放时，仍会回到 Core1 的arena中，此时可能出现对同一个arena的并发访问，但因为此种情况出现概率并不高，通过arena锁的保护就可以解决问题。
+- 并发访问：由于分配严格绑定在“当前执行核心”的 Arena 上，同一进程的不同线程若运行在不同核心，会分别访问各自核心的 Arena，天然避免了并发访问同一个 Free List 的锁竞争。用户态热路径仅追加本线程或本 Arena 的轻量修改日志，不直接触碰内核真值 `page_slot[]/chunk_gen[]`。
+- 线程跨核迁移：若线程从 Core 1 迁移到 Core 2，无需特殊回滚操作。其在 Core 1 申请的内存在使用完毕释放时，仍会回到 Core1 的 Arena 中。此时对同一个 Arena 的真值更新统一由内核在调度边界原子化消费日志并提交，因为跨核心free导致没有及时提交的log也能容忍，只是有页面被延迟free释放了，避免在用户态分配/释放热路径中引入重型同步。
+
+2.5 当前拍板的内核实现约束（已确认）
+- owner slot 防复用：接受 generation 防 ABA 方案。slot 不仅是索引，还要带代际校验。
+- switch-out 日志提交：第一版不做异步 worker，保持同步提交，后续再评估复杂度。
+- switch-in 脏区选择：第一版线性扫描 `chunk_gen[]`，不引入额外 dirty 索引结构。
+- 页表失效策略：第一版采用 `unmap`（清 PTE）路径，不采用 `PROT_NONE`。
+- `mm_ctx` 存储位置：只能使用外部 `arena_mm_ctx` 私有表，不改 `mm_struct`/`task_struct` 布局。
+- 跨核 free 延迟：第一版不实现阈值，默认可容忍一个调度周期内的延迟提交。
+
+2.6 `unmap` 后 page fault 的强制语义（安全红线）
+- 被 `unmap` 的 Arena 页在当前 `mm` 上访问时，必然触发缺页异常。
+- fault helper 必须先查 `page_slot[] + owner_table[]` 真值：
+  - 若 owner 仍是当前 `mm`：允许恢复映射。
+  - 若 owner 已是其他 `mm`：必须拒绝访问并返回 `SIGSEGV`。
+  - 若页为空闲 slot：同样拒绝访问，不允许走匿名页默认补页路径。
+- 结论：`unmap` 只是触发器，真正安全性由 fault 路由中的 ownership 判定保证。
+
+2.7 内核侧架构图（第一版）
+```mermaid
+flowchart LR
+    A[User Shadow Log] --> B[switch-out prev: drain log]
+    B --> C[Kernel Truth: page_slot + owner_table]
+    B --> D[chunk_gen + global_commit_seq]
+    D --> E[switch-in next: linear scan chunk_gen]
+    E --> F[unmap unauthorized PTE ranges]
+    F --> G[Access fault]
+    G --> H{owner == current mm?}
+    H -- yes --> I[restore mapping]
+    H -- no --> J[VM_FAULT_SIGSEGV]
+    E --> K[arena_mm_ctx.last_seen_gen update]
+```
+
+2.8 ⚠ 调度路径实现约束（需严格遵守）
+- `context_switch()` 处于原子上下文，不能执行可能睡眠的 `mmap_write_lock` 与 `zap_page_range`。
+- 因此第一版内核实现拆为两段：
+  - 调度路径：仅更新 generation 和标记 `needs_pt_sync`。
+  - 安全上下文：在持有 `mmap_write_lock(mm)` 时调用 `memory_delegation_sync_mm()` 执行实际 `unmap`。
+- 该约束不改变安全模型，但决定了“撤销映射”的实际触发点必须在可睡眠上下文中。
+
 
 ---
 三、 子课题二：智能应用感知的内核层资源协同优化

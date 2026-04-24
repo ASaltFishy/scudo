@@ -46,14 +46,16 @@ namespace scudo {
 // Linux 选取 32TB 附近的空洞区域，与典型 ASLR 布局冲突概率低。
 // Android 真机常见 39-bit 用户态 VA（512 GB），因此改用更低地址窗口。
 // 最终产品中可通过配置、broker 发布或内核保留区域机制确定。
-#if SCUDO_ANDROID
+#if defined(SCUDO_SHARED_ARENA_BASE_ADDR)
+static constexpr uptr kSharedArenaBaseAddr = SCUDO_SHARED_ARENA_BASE_ADDR;
+#elif SCUDO_ANDROID
 static constexpr uptr kSharedArenaBaseAddr = 0x1000000000ULL; // 64 GB
 #else
 static constexpr uptr kSharedArenaBaseAddr = 0x200000000000ULL; // 32 TB
 #endif
 
-// 每个核心 Arena 的容量（256 MB）。
-static constexpr uptr kArenaCapacityPerCore = 256ULL * 1024 * 1024;
+// 每个核心 Arena 的容量（512 MB）。
+static constexpr uptr kArenaCapacityPerCore = 512ULL * 1024 * 1024;
 
 // 支持的最大 CPU 核心数。
 static constexpr u32 kArenaMaxCores = 16;
@@ -69,6 +71,37 @@ static constexpr u32 kFreeListEnd = 0xFFFFFFFFU;
 
 // FreeBlockHeader 校验魔数，用于区分有效空闲块与未初始化内存。
 static constexpr u32 kFreeBlockMagic = 0xF4EEB10Cu;
+
+// 用户态和内核态共享的 per-(mm, cpu) 操作日志 ring buffer。
+// 必须与 kernel `include/uapi/linux/memory_delegation.h` 保持一致。
+static constexpr u32 kLogRingMagic = 0x4d44524cU; // "MDRL"
+static constexpr u16 kLogRingVersion = 1u;
+
+enum class SharedArenaLogOp : u8 {
+  Alloc = 1,
+  Free = 2,
+};
+
+struct SharedArenaLogEntry {
+  u8  Op;
+  u8  Reserved;
+  u16 Reserved2;
+  u32 StartPage;
+  u32 NumPages;
+};
+
+struct SharedArenaLogRing {
+  u32        Magic;
+  u16        Version;
+  u16        Flags;
+  u32        Capacity;
+  u32        ArenaNrPages;
+  u32        RingSize;
+  atomic_u32 Head;
+  atomic_u32 Tail;
+  atomic_u32 Dropped;
+  u32        Reserved;
+};
 
 // ---------------------------------------------------------------------------
 // 内存压力水位线（DESIGN.md §2.1）
@@ -145,8 +178,8 @@ public:
   // 将一个块归还到 Arena（DESIGN.md §2.1 缓存交接 + §2.4 跨核迁移）。
   // CommitBase / CommitSize 均为绝对 VA，位于本 Arena 数据区范围内。
   // 按 VA 地址有序插入侵入式双向空闲链表，并自动合并相邻空闲块。
-  // 永远成功（侵入式链表无容量上限），因此返回 void。
-  void store(uptr CommitBase, uptr CommitSize);
+  // 若日志 ring 已满则拒绝归还，避免用户态 freelist 与内核真值表失配。
+  bool store(uptr CommitBase, uptr CommitSize);
 
   // 尝试分配一个满足 [Size + HeadersSize, Alignment] 的块。
   // 优先从侵入式空闲链表做 best-fit 查找（+ 尾部切割），
@@ -186,11 +219,20 @@ public:
   void reset();
 
   int getShmFd() const { return ShmFd; }
+  uptr getDataBaseAddr() const { return DataBase; }
+  u32 getTotalDataPages() const { return Hdr ? Hdr->TotalDataPages : 0; }
 
 private:
   // 跨进程 futex 自旋锁（存储于共享内存中的 Hdr->Lock）。
   void lock();
   void unlock();
+  bool appendLogLocked(SharedArenaLogOp Op, uptr CommitBase, uptr CommitSize);
+  bool initLogRing();
+  bool registerWithKernel();
+  SharedArenaLogEntry *getLogEntries() const {
+    return reinterpret_cast<SharedArenaLogEntry *>(
+        reinterpret_cast<char *>(LogRing) + sizeof(SharedArenaLogRing));
+  }
 
   // 页偏移 ↔ 绝对 VA 转换
   uptr pageOffToAddr(u32 PageOff) const {
@@ -211,6 +253,8 @@ private:
   uptr              BaseAddr    = 0;      // 固定 VA 起始
   uptr              DataBase    = 0;      // 数据区起始 = BaseAddr + kArenaHeaderSize
   SharedArenaHeader *Hdr        = nullptr; // 指向映射后的元数据头
+  SharedArenaLogRing *LogRing   = nullptr;
+  uptr              LogRingSize = 0;
 };
 
 // ---------------------------------------------------------------------------

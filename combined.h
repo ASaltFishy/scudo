@@ -775,6 +775,27 @@ public:
     return getSize(Ptr, &Header);
   }
 
+  // Helper for benchmarks: returns true if Ptr is a primary allocation (ClassId != 0).
+  bool isPrimaryAllocationPtr(const void *Ptr) {
+    initThreadMaybe();
+#ifdef GWP_ASAN_HOOKS
+    if (UNLIKELY(GuardedAlloc.pointerIsMine(Ptr)))
+      return false;
+#endif // GWP_ASAN_HOOKS
+    if (!Ptr || !isAligned(reinterpret_cast<uptr>(Ptr), MinAlignment))
+      return false;
+    Ptr = getHeaderTaggedPointer(const_cast<void *>(Ptr));
+    Chunk::UnpackedHeader Header;
+    Chunk::loadHeader(Cookie, Ptr, &Header);
+    if (UNLIKELY(Header.State != Chunk::State::Allocated))
+      return false;
+    return Header.ClassId != 0;
+  }
+
+  void getSecondaryCacheRetrieveStats(u32 *OutCalls, u32 *OutHits) {
+    Secondary.getCacheRetrieveStats(OutCalls, OutHits);
+  }
+
   void getStats(StatCounters S) {
     initThreadMaybe();
     Stats.get(S);
