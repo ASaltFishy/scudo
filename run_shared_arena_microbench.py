@@ -122,7 +122,9 @@ def remote_shell(remote_host, command, capture_output=False):
     return run(cmd, capture_output=capture_output)
 
 
-def adb_remote_cmd(remote_host, adb_bin, shell_fragment, capture_output=False):
+def adb_remote_cmd(remote_host, adb_bin, shell_fragment, capture_output=False, use_su=False):
+    if use_su:
+        shell_fragment = f"su -c {shlex.quote(shell_fragment)}"
     cmd = f"{shlex.quote(adb_bin)} shell {shlex.quote(shell_fragment)}"
     return remote_shell(remote_host, cmd, capture_output=capture_output)
 
@@ -149,7 +151,7 @@ def deploy_binary(binary_path, remote_host, remote_stage_dir, device_dir, adb_bi
     )
 
 
-def kill_bench_processes(remote_host, adb_bin, binary_name):
+def kill_bench_processes(remote_host, adb_bin, binary_name, use_su=False):
     if not remote_host or not adb_bin:
         return
     device_cmd = (
@@ -157,6 +159,8 @@ def kill_bench_processes(remote_host, adb_bin, binary_name):
         f"kill -9 $p; "
         f"done; true"
     )
+    if use_su:
+        device_cmd = f"su -c {shlex.quote(device_cmd)}"
     cmd = [
         *SSH_BASE_ARGS,
         remote_host,
@@ -625,6 +629,54 @@ def write_summary_md(summary_df, output_md, args):
         write_metric_tables(f, summary_df, "dealloc_only")
 
 
+def build_summary_df(df):
+    return (
+        df.groupby(["threads", "size_human", "size_bytes", "path", "metric"], as_index=False)
+        .agg(
+            mean_ns=("mean_ns", "mean"),
+            std_ns=("mean_ns", "std"),
+            route_hint=("route_hint", "first"),
+            secondary_cache_calls=("secondary_cache_calls", "first"),
+            secondary_cache_hits=("secondary_cache_hits", "first"),
+            secondary_cache_hit_rate=("secondary_cache_hit_rate", "first"),
+        )
+        .fillna({"std_ns": 0.0})
+    )
+
+
+def merge_existing_results(args, results_dir):
+    inputs = [Path(item) for item in parse_list(args.merge_inputs)]
+    frames = []
+    for item in inputs:
+        csv_path = item
+        if item.is_dir():
+            csv_path = item / "raw_results.csv"
+        if not csv_path.exists():
+            raise RuntimeError(f"合并输入不存在 raw_results.csv: {csv_path}")
+        frame = pd.read_csv(csv_path)
+        frame["source"] = str(item)
+        frames.append(frame)
+    if not frames:
+        raise RuntimeError("未提供任何 --merge-inputs")
+
+    df = pd.concat(frames, ignore_index=True)
+    raw_csv = results_dir / "raw_results.csv"
+    df.to_csv(raw_csv, index=False, quoting=csv.QUOTE_MINIMAL)
+
+    summary_df = build_summary_df(df)
+    summary_csv = results_dir / "summary.csv"
+    summary_df.to_csv(summary_csv, index=False, quoting=csv.QUOTE_MINIMAL)
+
+    plot_results(summary_df, results_dir)
+    output_md = results_dir / "summary.md"
+    write_summary_md(summary_df, output_md, args)
+
+    print(f"合并结果目录: {results_dir}")
+    print(f"原始数据: {raw_csv}")
+    print(f"汇总数据: {summary_csv}")
+    print(f"摘要: {output_md}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="批量运行 SharedArena Android microbench 并绘图")
     parser.add_argument(
@@ -655,7 +707,13 @@ def main():
     )
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--skip-deploy", action="store_true")
+    parser.add_argument("--use-su", action="store_true", help="通过 adb shell su -c 运行 benchmark")
     parser.add_argument("--results-dir", default=None)
+    parser.add_argument(
+        "--merge-inputs",
+        default="",
+        help="只合并已有结果，不运行 benchmark；输入为逗号分隔的结果目录或 raw_results.csv",
+    )
     args = parser.parse_args()
 
     results_dir = Path(args.results_dir) if args.results_dir else (
@@ -663,6 +721,10 @@ def main():
     )
     raw_dir = results_dir / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.merge_inputs:
+        merge_existing_results(args, results_dir)
+        return
 
     thread_counts = parse_threads(args.thread_counts)
     size_bytes = parse_sizes_bytes(args.sizes)
@@ -694,8 +756,9 @@ def main():
                 f"threads={threads} sizes={size_arg}",
                 flush=True,
             )
-            kill_bench_processes(args.remote_host, adb_bin, binary_path.name)
+            kill_bench_processes(args.remote_host, adb_bin, binary_path.name, args.use_su)
             time.sleep(1)
+            raw_path = raw_dir / f"threads{threads:02d}_rep{repetition:02d}.txt"
             if args.local_linux:
                 cmd = [
                     str(binary_path),
@@ -712,7 +775,13 @@ def main():
                 env = os.environ.copy()
                 env["MALLOC_USE_APP_DEFAULTS"] = "1"
                 env.update(extra_bench_env)
-                result = run(cmd, cwd=str(SCRIPT_DIR), env=env, capture_output=True)
+                try:
+                    result = run(cmd, cwd=str(SCRIPT_DIR), env=env,
+                                 capture_output=True)
+                except subprocess.CalledProcessError as exc:
+                    raw_path.write_text((exc.stdout or "") + (exc.stderr or ""),
+                                        encoding="utf-8")
+                    raise
             else:
                 env_exports = ""
                 if extra_bench_env:
@@ -728,8 +797,14 @@ def main():
                 )
                 if extra_bench_args:
                     shell_cmd += " " + " ".join(shlex.quote(x) for x in extra_bench_args)
-                result = adb_remote_cmd(args.remote_host, adb_bin, shell_cmd, capture_output=True)
-            raw_path = raw_dir / f"threads{threads:02d}_rep{repetition:02d}.txt"
+                try:
+                    result = adb_remote_cmd(
+                        args.remote_host, adb_bin, shell_cmd,
+                        capture_output=True, use_su=args.use_su)
+                except subprocess.CalledProcessError as exc:
+                    raw_path.write_text((exc.stdout or "") + (exc.stderr or ""),
+                                        encoding="utf-8")
+                    raise
             raw_path.write_text(result.stdout, encoding="utf-8")
             records = parse_benchmark_output(result.stdout, repetition, threads)
             all_records.extend(records)
@@ -743,18 +818,7 @@ def main():
     raw_csv = results_dir / "raw_results.csv"
     df.to_csv(raw_csv, index=False, quoting=csv.QUOTE_MINIMAL)
 
-    summary_df = (
-        df.groupby(["threads", "size_human", "size_bytes", "path", "metric"], as_index=False)
-        .agg(
-            mean_ns=("mean_ns", "mean"),
-            std_ns=("mean_ns", "std"),
-            route_hint=("route_hint", "first"),
-            secondary_cache_calls=("secondary_cache_calls", "first"),
-            secondary_cache_hits=("secondary_cache_hits", "first"),
-            secondary_cache_hit_rate=("secondary_cache_hit_rate", "first"),
-        )
-        .fillna({"std_ns": 0.0})
-    )
+    summary_df = build_summary_df(df)
     summary_csv = results_dir / "summary.csv"
     summary_df.to_csv(summary_csv, index=False, quoting=csv.QUOTE_MINIMAL)
 

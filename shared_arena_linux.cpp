@@ -11,12 +11,12 @@
 // 核心机制：
 //  1. Linux 使用 shm_open("/scudo_arena_N") 创建具名共享内存，任意进程均可
 //     按名打开。
-//     Android 使用 memfd / ASharedMemory 创建 backing fd，并通过父进程
-//     继承 fd 让后续 exec 进程 attach。
+//     Android 只连接常驻 memory_delegation_broker 获取 backing fd；应用进程
+//     不创建 backing，也不 fork 临时 broker。
 //  2. 用 MAP_SHARED | MAP_FIXED_NOREPLACE 将共享内存映射到固定 VA，使所有进程
 //     的同一 Arena 虚拟地址完全一致，实现池中块的零拷贝跨进程复用。
-//  3. 跨进程锁通过 futex(FUTEX_WAIT/WAKE) 实现，锁字段 (Hdr->Lock) 直接驻留
-//     在共享内存中，对所有进程可见。
+//  3. 跨进程锁通过用户态 spinlock 实现，锁字段 (Hdr->Lock) 直接驻留在
+//     共享内存中，对所有进程可见；arena 热路径不通过 futex 下陷到内核。
 //  4. 内存管理采用 Bump 指针 + 侵入式空闲链表混合策略（DESIGN.md §2.2）：
 //     首次分配走 Bump 指针（页面通过 page fault 按需提交），释放后的块
 //     按 VA 有序插入侵入式双向链表，支持前后合并和 best-fit 分配。
@@ -37,7 +37,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <linux/futex.h>
 #include <linux/rseq.h>
 #include <limits.h>
 #include <sched.h>
@@ -53,18 +52,6 @@
 #include <sys/syscall.h>
 #include <sys/un.h>
 #include <unistd.h>
-
-#if SCUDO_ANDROID
-#if defined(__has_include)
-#if __has_include(<android/sharedmem.h>)
-#include <android/sharedmem.h>
-#define SCUDO_SHARED_ARENA_HAS_ASHAREDMEM 1
-#endif
-#endif
-#ifndef SCUDO_SHARED_ARENA_HAS_ASHAREDMEM
-#define SCUDO_SHARED_ARENA_HAS_ASHAREDMEM 0
-#endif
-#endif
 
 // glibc 2.35+ 自动为每个线程注册 rseq，并导出以下符号。
 // 使用 weak 引用，在老版本 glibc 上优雅回退到 sched_getcpu()。
@@ -87,9 +74,8 @@ namespace scudo {
 static atomic_u32 SharedArenaForceForTesting = {};
 static atomic_u32 SharedArenaTraceCount = {};
 
-static SharedArenaPool SharedArenaPoolSingleton;
-
 SharedArenaPool &SharedArenaPool::getInstance() {
+  static SharedArenaPool SharedArenaPoolSingleton;
   return SharedArenaPoolSingleton;
 }
 
@@ -106,6 +92,8 @@ static atomic_u32 SharedArenaEnvCacheState = {};
 static atomic_u32 SharedArenaEnvAttach = {};
 static atomic_u32 SharedArenaEnvForce = {};
 static atomic_u32 SharedArenaEnvTrace = {};
+static atomic_u32 SharedArenaEnvResetOnInit = {};
+static atomic_u32 SharedArenaEnvDisable = {};
 
 static void initSharedArenaEnvCacheOnce() {
   // 0: uninitialized, 1: initialized
@@ -125,6 +113,13 @@ static void initSharedArenaEnvCacheOnce() {
                                             ? 1u
                                             : 0u,
                 memory_order_relaxed);
+    atomic_store(&SharedArenaEnvResetOnInit,
+                 sharedArenaEnvEnabled("SCUDO_SHARED_ARENA_RESET_ON_INIT") ? 1u
+                                                                           : 0u,
+                 memory_order_relaxed);
+    atomic_store(&SharedArenaEnvDisable,
+                 sharedArenaEnvEnabled("SCUDO_SHARED_ARENA_DISABLE") ? 1u : 0u,
+                 memory_order_relaxed);
     return;
   }
 
@@ -138,28 +133,29 @@ static bool sharedArenaAttachEnabled() {
   return atomic_load(&SharedArenaEnvAttach, memory_order_relaxed) != 0u;
 }
 
+static bool sharedArenaResetOnInitEnabled() {
+  initSharedArenaEnvCacheOnce();
+  return atomic_load(&SharedArenaEnvResetOnInit, memory_order_relaxed) != 0u;
+}
+
+static bool sharedArenaDisabled() {
+  initSharedArenaEnvCacheOnce();
+  return atomic_load(&SharedArenaEnvDisable, memory_order_relaxed) != 0u;
+}
+
 #if SCUDO_ANDROID
-// Android 通过两阶段协议完成无关进程 attach：
-//   1. CREATING：单一 creator 进程持有 creator lock，并创建全部 arena backing。
-//   2. READY：creator 启动 broker，对外按名字分发 arena fd；其他进程仅 attach。
-//
-// 这样可以避免“多个进程同时发现 broker 不存在，然后各自创建不同 backing”
-// 的竞态。
+// Android 只通过常驻系统 broker 完成无关进程 attach。应用进程不创建
+// backing fd、不抢 creator lock、不 fork 临时 broker。
 static constexpr char kSharedArenaBrokerName[] = "scudo_shared_arena_broker";
-static constexpr char kSharedArenaCreatorName[] = "scudo_shared_arena_creator";
 static constexpr u32 kSharedArenaBrokerMagic = 0x5341524EU; // "SARN"
-static constexpr u32 kSharedArenaInitRetryCount = 5000;
-static constexpr useconds_t kSharedArenaInitRetrySleepUs = 1000;
 
 enum class SharedArenaAndroidInitMode : u8 {
   Unknown = 0,
-  Create  = 1,
-  Attach  = 2,
+  Attach  = 1,
 };
 
 static SharedArenaAndroidInitMode SharedArenaInitMode =
     SharedArenaAndroidInitMode::Unknown;
-static int SharedArenaCreatorLockFd = -1;
 
 struct SharedArenaBrokerRequest {
   u32 Magic;
@@ -181,37 +177,10 @@ static void sharedArenaBrokerSockaddr(sockaddr_un &Addr, socklen_t &AddrLen) {
                                    sizeof(kSharedArenaBrokerName) - 1);
 }
 
-static void sharedArenaCreatorSockaddr(sockaddr_un &Addr, socklen_t &AddrLen) {
-  memset(&Addr, 0, sizeof(Addr));
-  Addr.sun_family = AF_UNIX;
-  Addr.sun_path[0] = '\0';
-  memcpy(Addr.sun_path + 1, kSharedArenaCreatorName,
-         sizeof(kSharedArenaCreatorName) - 1);
-  AddrLen = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 +
-                                   sizeof(kSharedArenaCreatorName) - 1);
-}
-
 static bool sharedArenaWriteExact(int Fd, const void *Buf, size_t Size) {
   const char *P = reinterpret_cast<const char *>(Buf);
   while (Size != 0) {
     const ssize_t N = write(Fd, P, Size);
-    if (N < 0) {
-      if (errno == EINTR)
-        continue;
-      return false;
-    }
-    if (N == 0)
-      return false;
-    P += N;
-    Size -= static_cast<size_t>(N);
-  }
-  return true;
-}
-
-static bool sharedArenaReadExact(int Fd, void *Buf, size_t Size) {
-  char *P = reinterpret_cast<char *>(Buf);
-  while (Size != 0) {
-    const ssize_t N = read(Fd, P, Size);
     if (N < 0) {
       if (errno == EINTR)
         continue;
@@ -241,110 +210,6 @@ static int sharedArenaConnectBroker() {
     return -1;
   }
   return Sock;
-}
-
-static bool sharedArenaBrokerAvailable() {
-  const int Sock = sharedArenaConnectBroker();
-  if (Sock < 0)
-    return false;
-  close(Sock);
-  return true;
-}
-
-static int sharedArenaTryAcquireCreatorLock() {
-  const int Sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (Sock < 0) {
-    sharedArenaTrace("creator lock socket failed errno=%d", errno);
-    return -1;
-  }
-
-  sockaddr_un Addr;
-  socklen_t AddrLen;
-  sharedArenaCreatorSockaddr(Addr, AddrLen);
-  if (bind(Sock, reinterpret_cast<sockaddr *>(&Addr), AddrLen) == 0) {
-    sharedArenaTrace("creator lock acquired");
-    return Sock;
-  }
-
-  const int SavedErrno = errno;
-  sharedArenaTrace("creator lock bind failed errno=%d", SavedErrno);
-  close(Sock);
-  errno = SavedErrno;
-  return -1;
-}
-
-static void sharedArenaReleaseCreatorLock() {
-  if (SharedArenaCreatorLockFd >= 0) {
-    close(SharedArenaCreatorLockFd);
-    SharedArenaCreatorLockFd = -1;
-  }
-}
-
-static bool sharedArenaSelectAndroidInitMode() {
-  if (sharedArenaAttachEnabled()) {
-    SharedArenaInitMode = SharedArenaAndroidInitMode::Attach;
-    sharedArenaTrace("android init mode=attach (env)");
-    return true;
-  }
-
-  for (u32 Attempt = 0; Attempt < kSharedArenaInitRetryCount; ++Attempt) {
-    if (sharedArenaBrokerAvailable()) {
-      SharedArenaInitMode = SharedArenaAndroidInitMode::Attach;
-      sharedArenaTrace("android init mode=attach (broker ready)");
-      return true;
-    }
-
-    const int CreatorFd = sharedArenaTryAcquireCreatorLock();
-    if (CreatorFd >= 0) {
-      SharedArenaCreatorLockFd = CreatorFd;
-      SharedArenaInitMode = SharedArenaAndroidInitMode::Create;
-      sharedArenaTrace("android init mode=create");
-      return true;
-    }
-
-    if (errno != EADDRINUSE) {
-      sharedArenaTrace("android init mode select failed errno=%d", errno);
-      return false;
-    }
-
-    usleep(kSharedArenaInitRetrySleepUs);
-  }
-
-  sharedArenaTrace("android init mode select timed out waiting for broker");
-  return false;
-}
-
-static bool sharedArenaSendBrokerReply(int Sock, int Status, int FdToSend) {
-  SharedArenaBrokerReply Reply = {};
-  Reply.Status = Status;
-
-  iovec Iov = {};
-  Iov.iov_base = &Reply;
-  Iov.iov_len = sizeof(Reply);
-
-  alignas(struct cmsghdr) char Control[CMSG_SPACE(sizeof(int))];
-  memset(Control, 0, sizeof(Control));
-
-  msghdr Msg = {};
-  Msg.msg_iov = &Iov;
-  Msg.msg_iovlen = 1;
-  if (FdToSend >= 0) {
-    Msg.msg_control = Control;
-    Msg.msg_controllen = sizeof(Control);
-    cmsghdr *Cmsg = CMSG_FIRSTHDR(&Msg);
-    Cmsg->cmsg_level = SOL_SOCKET;
-    Cmsg->cmsg_type = SCM_RIGHTS;
-    Cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-    *reinterpret_cast<int *>(CMSG_DATA(Cmsg)) = FdToSend;
-    Msg.msg_controllen = Cmsg->cmsg_len;
-  }
-
-  while (sendmsg(Sock, &Msg, MSG_NOSIGNAL) < 0) {
-    if (errno == EINTR)
-      continue;
-    return false;
-  }
-  return true;
 }
 
 static int sharedArenaRequestBrokerFd(u32 CoreId) {
@@ -405,6 +270,29 @@ static int sharedArenaRequestBrokerFd(u32 CoreId) {
   return ReceivedFd;
 }
 
+static bool sharedArenaBrokerAvailable() {
+  int Fd = sharedArenaRequestBrokerFd(0);
+  if (Fd < 0)
+    return false;
+  close(Fd);
+  return true;
+}
+
+static bool sharedArenaSelectAndroidInitMode() {
+  if (sharedArenaAttachEnabled())
+    sharedArenaTrace("SCUDO_SHARED_ARENA_ATTACH ignored on Android; using system broker");
+
+  if (sharedArenaBrokerAvailable()) {
+    SharedArenaInitMode = SharedArenaAndroidInitMode::Attach;
+    sharedArenaTrace("android init mode=attach (system broker ready)");
+    return true;
+  }
+
+  SharedArenaInitMode = SharedArenaAndroidInitMode::Unknown;
+  sharedArenaTrace("android init failed: system broker unavailable");
+  return false;
+}
+
 static void sharedArenaFdEnvName(u32 CoreId, char *Buf, size_t BufSize) {
   snprintf(Buf, BufSize, "SCUDO_SHARED_ARENA_FD_%u", CoreId);
 }
@@ -431,146 +319,6 @@ static bool sharedArenaGetInheritedFd(u32 CoreId, int &OutFd) {
   OutFd = Fd;
   return true;
 }
-
-static bool sharedArenaExportFd(u32 CoreId, int Fd) {
-#if SCUDO_ANDROID
-  char Name[64];
-  char Value[32];
-  sharedArenaFdEnvName(CoreId, Name, sizeof(Name));
-  snprintf(Value, sizeof(Value), "%d", Fd);
-  return setenv(Name, Value, 1) == 0;
-#else
-  (void)CoreId;
-  (void)Fd;
-  return true;
-#endif
-}
-
-static bool sharedArenaClearCloseOnExec(int Fd) {
-  const int Flags = fcntl(Fd, F_GETFD);
-  if (Flags < 0)
-    return false;
-  if ((Flags & FD_CLOEXEC) == 0)
-    return true;
-  return fcntl(Fd, F_SETFD, Flags & ~FD_CLOEXEC) == 0;
-}
-
-static int sharedArenaCreateAndroidBacking(u32 CoreId) {
-  char Name[64];
-  snprintf(Name, sizeof(Name), "scudo_arena_%u", CoreId);
-
-#if defined(SYS_memfd_create)
-  int Fd = static_cast<int>(syscall(SYS_memfd_create, Name, 0));
-  if (Fd >= 0) {
-    if (ftruncate(Fd, static_cast<off_t>(kArenaCapacityPerCore)) == 0) {
-      sharedArenaTrace("create backing core=%u via memfd fd=%d", CoreId, Fd);
-      return Fd;
-    }
-    sharedArenaTrace("create backing core=%u memfd ftruncate failed errno=%d",
-                     CoreId, errno);
-    close(Fd);
-    return -1;
-  }
-  sharedArenaTrace("create backing core=%u memfd_create failed errno=%d", CoreId,
-                   errno);
-#endif
-
-#if SCUDO_SHARED_ARENA_HAS_ASHAREDMEM
-  const int AshmemFd =
-      ASharedMemory_create(Name, static_cast<size_t>(kArenaCapacityPerCore));
-  sharedArenaTrace("create backing core=%u via ASharedMemory fd=%d errno=%d",
-                   CoreId, AshmemFd, errno);
-  return AshmemFd;
-#else
-  (void)Name;
-  sharedArenaTrace("create backing core=%u unavailable: no memfd/ASharedMemory",
-                   CoreId);
-  return -1;
-#endif
-}
-
-static void sharedArenaBrokerLoop(u32 NumCores, const SharedArena *Arenas) {
-  const int ListenFd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (ListenFd < 0) {
-    sharedArenaTrace("broker loop socket failed errno=%d", errno);
-    _exit(1);
-  }
-
-  sockaddr_un Addr;
-  socklen_t AddrLen;
-  sharedArenaBrokerSockaddr(Addr, AddrLen);
-  if (bind(ListenFd, reinterpret_cast<sockaddr *>(&Addr), AddrLen) != 0) {
-    sharedArenaTrace("broker loop bind failed errno=%d", errno);
-    close(ListenFd);
-    _exit(errno == EADDRINUSE ? 0 : 1);
-  }
-  if (listen(ListenFd, 4) != 0) {
-    sharedArenaTrace("broker loop listen failed errno=%d", errno);
-    close(ListenFd);
-    _exit(1);
-  }
-  sharedArenaTrace("broker loop ready num_cores=%u", NumCores);
-
-  for (;;) {
-    const int Client = accept4(ListenFd, nullptr, nullptr, SOCK_CLOEXEC);
-    if (Client < 0) {
-      if (errno == EINTR)
-        continue;
-      break;
-    }
-
-    SharedArenaBrokerRequest Request = {};
-    if (!sharedArenaReadExact(Client, &Request, sizeof(Request))) {
-      close(Client);
-      continue;
-    }
-
-    if (Request.Magic != kSharedArenaBrokerMagic ||
-        Request.CoreId >= NumCores) {
-      (void)sharedArenaSendBrokerReply(Client, -1, -1);
-      close(Client);
-      continue;
-    }
-
-    const int ArenaFd = Arenas[Request.CoreId].getShmFd();
-    sharedArenaTrace("broker serve core=%u fd=%d", Request.CoreId, ArenaFd);
-    (void)sharedArenaSendBrokerReply(Client, ArenaFd >= 0 ? 0 : -1, ArenaFd);
-    close(Client);
-  }
-
-  close(ListenFd);
-  _exit(1);
-}
-
-static bool sharedArenaStartBroker(u32 NumCores, const SharedArena *Arenas) {
-  const pid_t Pid = fork();
-  if (Pid < 0) {
-    sharedArenaTrace("start broker fork failed errno=%d", errno);
-    return false;
-  }
-  if (Pid == 0) {
-    (void)setsid();
-    const int NullFd = open("/dev/null", O_RDWR);
-    if (NullFd >= 0) {
-      (void)dup2(NullFd, STDIN_FILENO);
-      (void)dup2(NullFd, STDOUT_FILENO);
-      (void)dup2(NullFd, STDERR_FILENO);
-      if (NullFd > STDERR_FILENO)
-        close(NullFd);
-    }
-    sharedArenaBrokerLoop(NumCores, Arenas);
-    _exit(1);
-  }
-  sharedArenaTrace("start broker pid=%d", Pid);
-
-  for (u32 Attempt = 0; Attempt < 50; ++Attempt) {
-    if (sharedArenaBrokerAvailable())
-      return true;
-    usleep(1000);
-  }
-  sharedArenaTrace("start broker timeout waiting ready");
-  return false;
-}
 #endif
 
 bool sharedArenaForceEnabled() {
@@ -582,6 +330,10 @@ bool sharedArenaForceEnabled() {
   if (Override == 1u)
     return false;
   return atomic_load(&SharedArenaEnvForce, memory_order_relaxed) != 0u;
+}
+
+bool sharedArenaForceDisabledForTesting() {
+  return atomic_load(&SharedArenaForceForTesting, memory_order_relaxed) == 1u;
 }
 
 void setSharedArenaForceForTesting(bool Enabled) {
@@ -638,37 +390,49 @@ void sharedArenaTrace(const char *Format, ...) {
 }
 
 // ---------------------------------------------------------------------------
-// SharedArena::lock / unlock（跨进程 futex 自旋锁）
+static inline void sharedArenaSpinPause() {
+#if defined(__x86_64__) || defined(__i386__)
+  __asm__ __volatile__("pause" ::: "memory");
+#elif defined(__aarch64__)
+  __asm__ __volatile__("yield" ::: "memory");
+#else
+  __asm__ __volatile__("" ::: "memory");
+#endif
+}
+
+// SharedArena::lock / unlock（跨进程用户态 spinlock）
 // ---------------------------------------------------------------------------
 
 void SharedArena::lock() {
   DCHECK(Hdr != nullptr);
-  // 快速路径：尝试 CAS 0 → 1。
-  // 使用返回 bool 的指针重载（overload 1）：
-  //   成功：返回 true，退出循环；
-  //   失败：Cmp 被更新为当前值（1），返回 false，进入 FUTEX_WAIT。
   u32 Expected = 0u;
   while (!atomic_compare_exchange_strong(&Hdr->Lock, &Expected, 1u,
                                          memory_order_acquire)) {
-    // 慢路径：通过 FUTEX_WAIT 进入睡眠，避免忙等占用 CPU。
-    syscall(SYS_futex,
-            reinterpret_cast<uptr>(&Hdr->Lock.ValDoNotUse),
-            FUTEX_WAIT, 1, nullptr, nullptr, 0);
-    Expected = 0u; // 重置期望值，准备下次尝试
+    do {
+      sharedArenaSpinPause();
+    } while (atomic_load(&Hdr->Lock, memory_order_relaxed) != 0u);
+    Expected = 0u;
   }
 }
 
 void SharedArena::unlock() {
   DCHECK(Hdr != nullptr);
   atomic_store(&Hdr->Lock, 0u, memory_order_release);
-  // 唤醒至多一个等待者。
-  syscall(SYS_futex,
-          reinterpret_cast<uptr>(&Hdr->Lock.ValDoNotUse),
-          FUTEX_WAKE, 1, nullptr, nullptr, 0);
 }
 
 bool SharedArena::appendLogLocked(SharedArenaLogOp Op, uptr CommitBase,
-                                  uptr CommitSize) {
+                                  uptr CommitSize, u16 Flags) {
+  const uptr PageSize = getPageSizeCached();
+  if (UNLIKELY(!isAligned(CommitBase, PageSize)))
+    return false;
+
+  return appendLogPagesLocked(Op, static_cast<u8>(CoreId),
+                              addrToPageOff(CommitBase), CommitSize, Flags);
+}
+
+bool SharedArena::appendLogPagesLocked(SharedArenaLogOp Op, u8 SrcCpu,
+                                       u32 StartPage, uptr CommitSize,
+                                       u16 Flags) {
   // Bench-only no-kernel mode: the kernel does not consume the ring (Head never
   // advances). Mask out all ring operations so the arena path doesn't
   // self-disable due to a full ring. NOT safe for production semantics.
@@ -678,27 +442,31 @@ bool SharedArena::appendLogLocked(SharedArenaLogOp Op, uptr CommitBase,
   DCHECK(LogRing != nullptr);
 
   const uptr PageSize = getPageSizeCached();
-  if (UNLIKELY(CommitSize == 0 || !isAligned(CommitBase, PageSize) ||
-               !isAligned(CommitSize, PageSize)))
+  if (UNLIKELY(CommitSize == 0 || !isAligned(CommitSize, PageSize)))
     return false;
 
   const u32 Capacity = LogRing->Capacity;
   if (UNLIKELY(Capacity == 0))
     return false;
 
-  const u32 Head = atomic_load(&LogRing->Head, memory_order_acquire);
-  const u32 Tail = atomic_load(&LogRing->Tail, memory_order_relaxed);
+  u32 Head = atomic_load(&LogRing->Head, memory_order_acquire);
+  u32 Tail = atomic_load(&LogRing->Tail, memory_order_relaxed);
   if (UNLIKELY(Tail - Head >= Capacity)) {
-    atomic_fetch_add(&LogRing->Dropped, 1u, memory_order_relaxed);
-    return false;
+    sched_yield();
+    Head = atomic_load(&LogRing->Head, memory_order_acquire);
+    Tail = atomic_load(&LogRing->Tail, memory_order_relaxed);
+    if (UNLIKELY(Tail - Head >= Capacity)) {
+      atomic_fetch_add(&LogRing->Dropped, 1u, memory_order_relaxed);
+      return false;
+    }
   }
 
   SharedArenaLogEntry *Entries = getLogEntries();
   SharedArenaLogEntry &Entry = Entries[Tail % Capacity];
   Entry.Op = static_cast<u8>(Op);
-  Entry.Reserved = 0;
-  Entry.Reserved2 = 0;
-  Entry.StartPage = addrToPageOff(CommitBase);
+  Entry.SrcCpu = SrcCpu;
+  Entry.Flags = Flags;
+  Entry.StartPage = StartPage;
   Entry.NumPages = static_cast<u32>(CommitSize / PageSize);
   atomic_store(&LogRing->Tail, Tail + 1, memory_order_release);
   return true;
@@ -774,6 +542,35 @@ bool SharedArena::registerWithKernel() {
   return false;
 }
 
+bool SharedArena::refreshLogRingForCurrentProcess() {
+  if (!Initialized)
+    return true;
+
+  if (UNLIKELY(ShmFd < 0 || BaseAddr == 0)) {
+    sharedArenaTrace("arena refresh core=%u missing backing fd/base", CoreId);
+    return false;
+  }
+
+  void *P = mmap(reinterpret_cast<void *>(BaseAddr), kArenaCapacityPerCore,
+                 PROT_READ | PROT_WRITE,
+                 MAP_SHARED | MAP_FIXED | MAP_NORESERVE, ShmFd, 0);
+  if (P == MAP_FAILED) {
+    sharedArenaTrace("arena refresh core=%u remap failed base=0x%zx errno=%d",
+                     CoreId, BaseAddr, errno);
+    return false;
+  }
+  Hdr = reinterpret_cast<SharedArenaHeader *>(BaseAddr);
+
+  if (LogRing != nullptr && LogRingSize != 0)
+    munmap(reinterpret_cast<void *>(LogRing), LogRingSize);
+  LogRing = nullptr;
+  LogRingSize = 0;
+
+  if (!initLogRing())
+    return false;
+  return registerWithKernel();
+}
+
 // ---------------------------------------------------------------------------
 // SharedArena::releasePages — 释放 Arena 内指定范围的物理页（DESIGN.md §2.1）
 //
@@ -814,19 +611,6 @@ bool SharedArena::init(u32 Id) {
       Fd = sharedArenaRequestBrokerFd(Id);
     if (Fd < 0) {
       sharedArenaTrace("arena init core=%u attach failed", Id);
-      return false;
-    }
-    break;
-  case SharedArenaAndroidInitMode::Create:
-    Fd = sharedArenaCreateAndroidBacking(Id);
-    if (Fd < 0) {
-      sharedArenaTrace("arena init core=%u create backing failed", Id);
-      return false;
-    }
-    if (!sharedArenaClearCloseOnExec(Fd) || !sharedArenaExportFd(Id, Fd)) {
-      sharedArenaTrace("arena init core=%u export fd failed errno=%d", Id,
-                       errno);
-      close(Fd);
       return false;
     }
     break;
@@ -948,22 +732,39 @@ void SharedArena::reset() {
 // 侵入式链表无容量上限，永远成功。
 // ---------------------------------------------------------------------------
 
-bool SharedArena::store(uptr CommitBase, uptr CommitSize) {
+bool SharedArena::store(uptr CommitBase, uptr CommitSize, SharedArena *LogArena) {
   if (UNLIKELY(!Initialized || CommitSize == 0))
     return false;
 
   const uptr PageSize = getPageSizeCached();
   const u32 NewPageOff = addrToPageOff(CommitBase);
   const u32 NewPages   = static_cast<u32>(CommitSize / PageSize);
+  if (LogArena == nullptr)
+    LogArena = this;
 
-  lock();
-  if (UNLIKELY(!appendLogLocked(SharedArenaLogOp::Free, CommitBase,
-                                CommitSize))) {
+  if (LogArena == this) {
+    lock();
+  } else if (LogArena->CoreId < CoreId) {
+    LogArena->lock();
+    lock();
+  } else {
+    lock();
+    LogArena->lock();
+  }
+
+  if (UNLIKELY(!LogArena->appendLogPagesLocked(
+          SharedArenaLogOp::Free, static_cast<u8>(CoreId), NewPageOff,
+          CommitSize))) {
+    if (LogArena != this)
+      LogArena->unlock();
     unlock();
-    sharedArenaTrace("log append failed on free core=%u base=0x%zx size=%zu",
-                     CoreId, CommitBase, CommitSize);
+    sharedArenaTrace(
+        "log append failed on free owner_core=%u log_core=%u base=0x%zx size=%zu",
+        CoreId, LogArena->CoreId, CommitBase, CommitSize);
     return false;
   }
+  if (LogArena != this)
+    LogArena->unlock();
 
   // 按 VA 顺序查找插入位置：找到第一个 PageOff > NewPageOff 的节点，
   // 新块插入到它的前面（PrevOff 和 NextOff 之间）。
@@ -1119,8 +920,9 @@ bool SharedArena::retrieve(uptr Size, uptr Alignment, uptr HeadersSize,
 
   Hdr->TotalRetrievedBytes += AllocSize;
   Hdr->RetrieveCount++;
+  const u16 LogFlags = 0;
   if (UNLIKELY(!appendLogLocked(SharedArenaLogOp::Alloc, AllocBase,
-                                AllocSize))) {
+                                AllocSize, LogFlags))) {
     if (BestOff != kFreeListEnd) {
       if (AllocBase == pageOffToAddr(BestOff)) {
         FreeBlockHeader *Best = getFreeBlock(BestOff);
@@ -1174,6 +976,43 @@ void SharedArena::getStats(uptr &OutFreeCount, uptr &OutDonatedBytes,
   OutRetrievedBytes = Hdr->TotalRetrievedBytes;
 }
 
+void SharedArena::getDebugStats(SharedArenaDebugStats &Out) const {
+  Out = {};
+  Out.CoreId = CoreId;
+  if (!Initialized || Hdr == nullptr)
+    return;
+
+  const uptr PageSize = getPageSizeCached();
+  Out.Initialized = 1;
+  Out.TotalDataPages = Hdr->TotalDataPages;
+  Out.BumpOffsetInPages = Hdr->BumpOffsetInPages;
+  Out.FreeListHeadPageOff = Hdr->FreeListHeadPageOff;
+  Out.FreeCount = Hdr->FreeCount;
+  Out.TotalDonatedBytes = Hdr->TotalDonatedBytes;
+  Out.TotalRetrievedBytes = Hdr->TotalRetrievedBytes;
+  Out.DonateCount = Hdr->DonateCount;
+  Out.RetrieveCount = Hdr->RetrieveCount;
+
+  if (LogRing != nullptr) {
+    Out.LogHead = atomic_load(&LogRing->Head, memory_order_acquire);
+    Out.LogTail = atomic_load(&LogRing->Tail, memory_order_acquire);
+    Out.LogDropped = atomic_load(&LogRing->Dropped, memory_order_acquire);
+  }
+
+  u32 Cur = Hdr->FreeListHeadPageOff;
+  const u32 MaxWalk = Hdr->TotalDataPages + 1;
+  while (Cur != kFreeListEnd && Out.FreeListWalkCount < MaxWalk) {
+    FreeBlockHeader *Blk = getFreeBlock(Cur);
+    if (Blk->Magic != kFreeBlockMagic) {
+      Out.FreeListBadMagic++;
+      break;
+    }
+    Out.FreeListBytes += static_cast<uptr>(Blk->SizeInPages) * PageSize;
+    Out.FreeListWalkCount++;
+    Cur = Blk->NextPageOff;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // SharedArenaPool::getOwningArena（DESIGN.md §2.4 跨核迁移释放路径）
 //
@@ -1223,6 +1062,18 @@ static uptr parseProcMemInfoValue(const char *Buf, const char *FieldName) {
   return 0;
 }
 
+static u32 sharedArenaEnvU32(const char *Name, u32 Fallback) {
+  const char *Value = getenv(Name);
+  if (Value == nullptr || Value[0] == '\0')
+    return Fallback;
+
+  char *End = nullptr;
+  unsigned long Parsed = strtoul(Value, &End, 10);
+  if (End == Value || *End != '\0' || Parsed > UINT32_MAX)
+    return Fallback;
+  return static_cast<u32>(Parsed);
+}
+
 bool SharedArenaPool::checkMemoryPressure() {
   int Fd = open("/proc/meminfo", O_RDONLY);
   if (Fd < 0)
@@ -1243,12 +1094,30 @@ bool SharedArenaPool::checkMemoryPressure() {
 
   const uptr UsagePercent =
       (MemTotalKB - MemAvailableKB) * 100 / MemTotalKB;
-  return UsagePercent >= kMemoryPressureThresholdPercent;
+  const u32 ThresholdPercent =
+      sharedArenaEnvU32("SCUDO_SHARED_ARENA_PRESSURE_THRESHOLD",
+                        kMemoryPressureThresholdPercent);
+  const bool Active = UsagePercent >= ThresholdPercent;
+  sharedArenaTrace("pressure mem_total_kb=%zu mem_available_kb=%zu usage=%zu threshold=%u active=%u",
+                   MemTotalKB, MemAvailableKB, UsagePercent,
+                   ThresholdPercent, Active ? 1u : 0u);
+  return Active;
 }
 
 bool SharedArenaPool::shouldUseArena() {
   if (!Initialized)
     return false;
+
+  if (UNLIKELY(OwnerPid != static_cast<uptr>(getpid()))) {
+    init();
+    if (!Initialized)
+      return false;
+  }
+
+  if (sharedArenaForceDisabledForTesting()) {
+    ArenaActive = false;
+    return false;
+  }
 
   if (sharedArenaForceEnabled()) {
     static const bool Logged = []() {
@@ -1262,7 +1131,10 @@ bool SharedArenaPool::shouldUseArena() {
 
   const u32 Count =
       atomic_fetch_add(&AllocCounter, 1u, memory_order_relaxed);
-  if ((Count & (kPressureCheckInterval - 1)) == 0)
+  const u32 CheckInterval =
+      sharedArenaEnvU32("SCUDO_SHARED_ARENA_PRESSURE_CHECK_INTERVAL",
+                        kPressureCheckInterval);
+  if (CheckInterval == 0 || (Count % CheckInterval) == 0)
     ArenaActive = checkMemoryPressure();
 
   return ArenaActive;
@@ -1275,8 +1147,33 @@ bool SharedArenaPool::shouldUseArena() {
 // 外层调用保证了该init函数只会被一个线程调用，不需要做线程安全分析
 // 每个进程都会有唯一一个线程调用该函数，创建shared fd
 void SharedArenaPool::init() NO_THREAD_SAFETY_ANALYSIS{
-  if (Initialized)
+  const uptr CurrentPid = static_cast<uptr>(getpid());
+
+  if (sharedArenaDisabled()) {
+    Initialized = false;
+    OwnerPid = CurrentPid;
+    NumCores = 0;
     return;
+  }
+
+  if (Initialized && OwnerPid == CurrentPid)
+    return;
+
+  if (Initialized && OwnerPid != CurrentPid) {
+    bool allOk = true;
+
+    for (u32 I = 0; I < NumCores; I++) {
+      if (Arenas[I].isInitialized() &&
+          !Arenas[I].refreshLogRingForCurrentProcess())
+        allOk = false;
+    }
+    Initialized = allOk;
+    if (allOk)
+      OwnerPid = CurrentPid;
+    sharedArenaTrace("pool refreshed after fork ready=%d pid=%zu",
+                     allOk ? 1 : 0, CurrentPid);
+    return;
+  }
 
   NumCores = getNumberOfCPUs();
   if (NumCores == 0)
@@ -1284,41 +1181,27 @@ void SharedArenaPool::init() NO_THREAD_SAFETY_ANALYSIS{
   if (NumCores > kArenaMaxCores)
     NumCores = kArenaMaxCores;
 
-  bool ShouldCreateFreshBacking =
-#if SCUDO_ANDROID
-      false;
-#else
-      !sharedArenaAttachEnabled();
-#endif
 #if SCUDO_ANDROID
   SharedArenaInitMode = SharedArenaAndroidInitMode::Unknown;
-  sharedArenaReleaseCreatorLock();
   if (!sharedArenaSelectAndroidInitMode()) {
-    sharedArenaTrace("pool init failed selecting android init mode");
+    sharedArenaTrace("pool init failed: android system broker unavailable");
     Initialized = false;
     return;
   }
-  ShouldCreateFreshBacking =
-      SharedArenaInitMode == SharedArenaAndroidInitMode::Create;
   sharedArenaTrace("pool init android mode=%u num_cores=%u",
                    static_cast<unsigned>(SharedArenaInitMode), NumCores);
-#endif
-
+#else
   // Linux: 清理上一次进程会话遗留的具名共享内存。
   // /dev/shm (tmpfs) 上的文件在进程退出后仍然存在，其中的元数据
   //（freelist head、entries 等）对应旧进程的状态，直接复用会导致崩溃。
-  //
-  // Android: 只有拿到 creator lock、进入 CREATING 阶段的单一进程允许创建
-  // backing；其他进程在 READY 阶段只 attach 到 broker。
-  if (ShouldCreateFreshBacking) {
-#if !SCUDO_ANDROID
+  if (!sharedArenaAttachEnabled()) {
     for (u32 I = 0; I < NumCores; I++) {
       char ShmName[64];
       snprintf(ShmName, sizeof(ShmName), "/scudo_arena_%u", I);
       shm_unlink(ShmName);
     }
-#endif
   }
+#endif
 
   // 为每个 CPU 核心初始化一个 Arena。
   // 若某个 Arena 初始化失败，则 Pool 的 Initialized 也标记为 false, 走原来的MemAllocaCache路径。
@@ -1327,15 +1210,21 @@ void SharedArenaPool::init() NO_THREAD_SAFETY_ANALYSIS{
     if (!Arenas[I].init(I))
       allOk = false;
   }
+  if (allOk && sharedArenaResetOnInitEnabled()) {
+    sharedArenaTrace("pool init: resetting shared arena state by env");
+    for (u32 I = 0; I < NumCores; I++) {
+      if (Arenas[I].isInitialized())
+        Arenas[I].reset();
+    }
+  }
 #if SCUDO_ANDROID
-  if (allOk && SharedArenaInitMode == SharedArenaAndroidInitMode::Create)
-    allOk = sharedArenaStartBroker(NumCores, Arenas);
-  sharedArenaReleaseCreatorLock();
   if (!allOk)
     SharedArenaInitMode = SharedArenaAndroidInitMode::Unknown;
 #endif
   sharedArenaTrace("pool init finished ready=%d", allOk ? 1 : 0);
   Initialized = allOk;
+  if (allOk)
+    OwnerPid = CurrentPid;
 }
 
 void SharedArenaPool::reset() {

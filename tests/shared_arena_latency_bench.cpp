@@ -56,6 +56,83 @@ static uint64_t nowNs() {
           .count());
 }
 
+static u64 getEnvU64(const char *Name, u64 Default) {
+  const char *Value = getenv(Name);
+  if (!Value || Value[0] == '\0')
+    return Default;
+  char *End = nullptr;
+  errno = 0;
+  const unsigned long long Parsed = strtoull(Value, &End, 0);
+  if (errno != 0 || End == Value)
+    return Default;
+  return static_cast<u64>(Parsed);
+}
+
+static bool shouldTraceBenchPhase(uptr Size, u64 Iter) {
+  const uptr MinSize = static_cast<uptr>(
+      getEnvU64("SCUDO_BENCH_TRACE_MIN_SIZE", 8ULL << 20));
+  const u64 Every = getEnvU64("SCUDO_BENCH_TRACE_EVERY", 1);
+  if (Every == 0 || Size < MinSize)
+    return false;
+  return (Iter % Every) == 0;
+}
+
+static void printProcMeminfo(const char *Label) {
+#if SCUDO_LINUX
+  FILE *F = fopen("/proc/meminfo", "r");
+  if (!F) {
+    printf("proc_meminfo: label=%s open_failed_errno=%d\n", Label, errno);
+    return;
+  }
+  char Line[256];
+  printf("proc_meminfo: label=%s", Label);
+  while (fgets(Line, sizeof(Line), F)) {
+    unsigned long Value = 0;
+    if (sscanf(Line, "MemTotal: %lu kB", &Value) == 1 ||
+        sscanf(Line, "MemFree: %lu kB", &Value) == 1 ||
+        sscanf(Line, "MemAvailable: %lu kB", &Value) == 1 ||
+        sscanf(Line, "Cached: %lu kB", &Value) == 1 ||
+        sscanf(Line, "SReclaimable: %lu kB", &Value) == 1 ||
+        sscanf(Line, "SUnreclaim: %lu kB", &Value) == 1) {
+      char *Colon = strchr(Line, ':');
+      if (!Colon)
+        continue;
+      *Colon = '\0';
+      printf(" %s=%lu_kB", Line, Value);
+    }
+  }
+  fclose(F);
+  printf("\n");
+  fflush(stdout);
+#else
+  (void)Label;
+#endif
+}
+
+static void printBenchPhase(const char *PathLabel, bool Delegated, uptr Size,
+                            bool WarmupPhase, u64 Iter, const char *Phase,
+                            void *Ptr) {
+#if SCUDO_LINUX
+  if (!shouldTraceBenchPhase(Size, Iter))
+    return;
+  const int Cpu = sched_getcpu();
+  printf("bench_phase: path=%s delegated=%d size=%zu phase=%s kind=%s iter=%"
+         PRIu64 " pid=%d tid=%lu cpu=%d ptr=%p ns=%" PRIu64 "\n",
+         PathLabel, Delegated ? 1 : 0, static_cast<size_t>(Size), Phase,
+         WarmupPhase ? "warmup" : "measure", Iter, getpid(),
+         static_cast<unsigned long>(pthread_self()), Cpu, Ptr, nowNs());
+  fflush(stdout);
+#else
+  (void)PathLabel;
+  (void)Delegated;
+  (void)Size;
+  (void)WarmupPhase;
+  (void)Iter;
+  (void)Phase;
+  (void)Ptr;
+#endif
+}
+
 static bool pinSelfToCpu(int Cpu) {
 #if SCUDO_LINUX
   cpu_set_t Set;
@@ -97,6 +174,40 @@ static void printAffinity(const char *Label) {
 #endif
 }
 
+static void printArenaDebugStats(const char *Label, SharedArenaPool &Pool) {
+  printf("arena_debug: label=%s ready=%d num_cores=%u\n", Label,
+         Pool.isReady() ? 1 : 0, Pool.getNumCores());
+  if (!Pool.isReady())
+    return;
+
+  const uptr PageSize = getPageSizeCached();
+  for (u32 Core = 0; Core < Pool.getNumCores(); ++Core) {
+    SharedArena *Arena = Pool.getArena(Core);
+    if (!Arena)
+      continue;
+    SharedArenaDebugStats S;
+    Arena->getDebugStats(S);
+    if (!S.Initialized)
+      continue;
+    const uptr BumpBytes = static_cast<uptr>(S.BumpOffsetInPages) * PageSize;
+    const uptr TotalBytes = static_cast<uptr>(S.TotalDataPages) * PageSize;
+    const u32 LogPending = S.LogTail - S.LogHead;
+    printf("arena_debug: core=%u bump_pages=%u total_pages=%u bump_bytes=%zu "
+           "total_bytes=%zu free_blocks=%u free_walk=%u free_bad_magic=%u "
+           "free_bytes=%zu donated=%zu retrieved=%zu donate_count=%u "
+           "retrieve_count=%u log_head=%u log_tail=%u log_pending=%u "
+           "log_dropped=%u\n",
+           S.CoreId, S.BumpOffsetInPages, S.TotalDataPages,
+           static_cast<size_t>(BumpBytes), static_cast<size_t>(TotalBytes),
+           S.FreeCount, S.FreeListWalkCount, S.FreeListBadMagic,
+           static_cast<size_t>(S.FreeListBytes),
+           static_cast<size_t>(S.TotalDonatedBytes),
+           static_cast<size_t>(S.TotalRetrievedBytes), S.DonateCount,
+           S.RetrieveCount, S.LogHead, S.LogTail, LogPending, S.LogDropped);
+  }
+  fflush(stdout);
+}
+
 static int firstUsableArenaCpu(SharedArenaPool &Pool) {
 #if SCUDO_LINUX
   if (!Pool.isReady() || Pool.getNumCores() == 0)
@@ -112,6 +223,45 @@ static int firstUsableArenaCpu(SharedArenaPool &Pool) {
 #endif
   return -1;
 }
+
+static u32 allowedCpuCount() {
+#if SCUDO_LINUX
+  cpu_set_t Allowed;
+  CPU_ZERO(&Allowed);
+  if (sched_getaffinity(0, sizeof(Allowed), &Allowed) != 0)
+    return 1;
+  u32 Count = 0;
+  const int Max = CPU_SETSIZE < 1024 ? CPU_SETSIZE : 1024;
+  for (int Cpu = 0; Cpu < Max; ++Cpu) {
+    if (CPU_ISSET(Cpu, &Allowed))
+      Count++;
+  }
+  return Count ? Count : 1;
+#else
+  return 1;
+#endif
+}
+
+static int firstAllowedCpu() {
+#if SCUDO_LINUX
+  cpu_set_t Allowed;
+  CPU_ZERO(&Allowed);
+  if (sched_getaffinity(0, sizeof(Allowed), &Allowed) == 0) {
+    const int Max = CPU_SETSIZE < 1024 ? CPU_SETSIZE : 1024;
+    for (int Cpu = 0; Cpu < Max; ++Cpu) {
+      if (CPU_ISSET(Cpu, &Allowed))
+        return Cpu;
+    }
+  }
+#endif
+  return 0;
+}
+
+enum class BenchPathMode {
+  Both,
+  DelegatedOnly,
+  TraditionalOnly,
+};
 
 struct SampleStats {
   uint64_t N = 0;
@@ -166,7 +316,7 @@ static void runBenchRound(LargeAllocator &Alloc, Options &Opt, bool Delegated,
   if (Delegated)
     setSharedArenaForceForTesting(true);
   else
-    clearSharedArenaForceForTesting();
+    setSharedArenaForceForTesting(false);
 
   OutSamples.clear();
   OutSamples.reserve(static_cast<size_t>(Iterations) * 3U);
@@ -174,7 +324,11 @@ static void runBenchRound(LargeAllocator &Alloc, Options &Opt, bool Delegated,
   constexpr unsigned char kPattern = 0x5A;
 
   for (u32 I = 0; I < Warmup; ++I) {
+    printBenchPhase(Label, Delegated, Size, /*WarmupPhase=*/true, I,
+                    "before_alloc", nullptr);
     void *P = Alloc.allocate(Opt, Size);
+    printBenchPhase(Label, Delegated, Size, /*WarmupPhase=*/true, I,
+                    "after_alloc", P);
     if (!P) {
       fprintf(stderr, "%s warmup alloc failed size=%zu iter=%u\n", Label,
               static_cast<size_t>(Size), I);
@@ -186,29 +340,51 @@ static void runBenchRound(LargeAllocator &Alloc, Options &Opt, bool Delegated,
               "%s warmup: ptr not in arena (delegated path may have fallen "
               "back)\n",
               Label);
-    if (TouchPagesWarmup)
+    if (TouchPagesWarmup) {
+      printBenchPhase(Label, Delegated, Size, /*WarmupPhase=*/true, I,
+                      "before_touch", P);
       touchAllocatedPages(P, Size, PageSize, kPattern);
+      printBenchPhase(Label, Delegated, Size, /*WarmupPhase=*/true, I,
+                      "after_touch", P);
+    }
     if (HoldUs != 0)
       std::this_thread::sleep_for(std::chrono::microseconds(HoldUs));
+    printBenchPhase(Label, Delegated, Size, /*WarmupPhase=*/true, I,
+                    "before_dealloc", P);
     Alloc.deallocate(Opt, P);
+    printBenchPhase(Label, Delegated, Size, /*WarmupPhase=*/true, I,
+                    "after_dealloc", P);
   }
 
   for (u64 I = 0; I < Iterations; ++I) {
+    printBenchPhase(Label, Delegated, Size, /*WarmupPhase=*/false, I,
+                    "before_alloc", nullptr);
     const uint64_t T0 = nowNs();
     void *P = Alloc.allocate(Opt, Size);
     const uint64_t T1 = nowNs();
+    printBenchPhase(Label, Delegated, Size, /*WarmupPhase=*/false, I,
+                    "after_alloc", P);
     if (!P) {
       fprintf(stderr, "%s alloc failed at iter %" PRIu64 "\n", Label, I);
       return;
     }
-    if (TouchPages)
+    if (TouchPages) {
+      printBenchPhase(Label, Delegated, Size, /*WarmupPhase=*/false, I,
+                      "before_touch", P);
       touchAllocatedPages(P, Size, PageSize, kPattern);
+      printBenchPhase(Label, Delegated, Size, /*WarmupPhase=*/false, I,
+                      "after_touch", P);
+    }
     if (HoldUs != 0)
       std::this_thread::sleep_for(std::chrono::microseconds(HoldUs));
 
     const uint64_t T2 = nowNs(); // end of "hold" (touch + use window)
+    printBenchPhase(Label, Delegated, Size, /*WarmupPhase=*/false, I,
+                    "before_dealloc", P);
     Alloc.deallocate(Opt, P);
     const uint64_t T3 = nowNs();
+    printBenchPhase(Label, Delegated, Size, /*WarmupPhase=*/false, I,
+                    "after_dealloc", P);
 
     OutSamples.push_back(T1 - T0); // alloc_only
     OutSamples.push_back(T2 - T1); // hold_only
@@ -275,8 +451,11 @@ static const char *routeHint(uptr Size) {
 }
 
 struct CombinedBenchAllocator : CombinedAllocator {
-  CombinedBenchAllocator() { initThreadMaybe(); }
-  ~CombinedBenchAllocator() { unmapTestOnly(); }
+  CombinedBenchAllocator() {
+    init();
+    initThreadMaybe();
+  }
+  ~CombinedBenchAllocator() = default;
 };
 
 struct ThreadCtx {
@@ -296,6 +475,7 @@ struct ThreadCtx {
 
 struct ThreadCtxCombined {
   CombinedBenchAllocator *Alloc = nullptr;
+  const char *PathLabel = nullptr;
   bool Delegated = false;
   uptr Size = 0;
   u32 Warmup = 0;
@@ -388,7 +568,7 @@ static void warmupAlloc(LargeAllocator &Alloc, Options &Opt, bool Delegated,
   if (Delegated)
     setSharedArenaForceForTesting(true);
   else
-    clearSharedArenaForceForTesting();
+    setSharedArenaForceForTesting(false);
 
   const uptr PageSize = getPageSizeCached();
   constexpr unsigned char kPattern = 0x5A;
@@ -490,6 +670,7 @@ static void runBenchRoundCombined(CombinedBenchAllocator &Alloc, bool Delegated,
                                   uptr Size, u32 Warmup, u64 Iterations,
                                   u64 HoldUs, bool TouchPages,
                                   bool TouchPagesWarmup,
+                                  const char *PathLabel,
                                   std::vector<uint64_t> &OutSamples,
                                   u64 &OutPrimary, u64 &OutSecondary,
                                   u64 &OutArena);
@@ -509,7 +690,10 @@ static BenchSummary runCrossProcessForkCombined(CombinedBenchAllocator &ParentAl
     u64 P = 0, S = 0, A = 0;
     runBenchRoundCombined(ParentAlloc, ParentDelegated, Size, Warmup,
                           /*Iterations=*/0, HoldUs, /*TouchPages=*/TouchPages,
-                          /*TouchPagesWarmup=*/TouchPagesWarmup, Dummy, P, S, A);
+                          /*TouchPagesWarmup=*/TouchPagesWarmup,
+                          ParentDelegated ? "parent_delegated_warmup"
+                                          : "parent_traditional_warmup",
+                          Dummy, P, S, A);
   }
 
   int Fds[2];
@@ -538,8 +722,10 @@ static BenchSummary runCrossProcessForkCombined(CombinedBenchAllocator &ParentAl
     u32 CallsAfter = 0, HitsAfter = 0;
     ChildAlloc.getSecondaryCacheRetrieveStats(&CallsBefore, &HitsBefore);
     runBenchRoundCombined(ChildAlloc, ChildDelegated, Size, Warmup, Iterations,
-                          HoldUs, TouchPages, TouchPagesWarmup, Samples, Primary,
-                          Secondary, Arena);
+                          HoldUs, TouchPages, TouchPagesWarmup,
+                          ChildDelegated ? "child_delegated"
+                                         : "child_traditional",
+                          Samples, Primary, Secondary, Arena);
     ChildAlloc.getSecondaryCacheRetrieveStats(&CallsAfter, &HitsAfter);
 
     ForkResultMsg Msg;
@@ -595,33 +781,35 @@ static void runBenchRoundCombined(CombinedBenchAllocator &Alloc, bool Delegated,
                                   uptr Size, u32 Warmup, u64 Iterations,
                                   u64 HoldUs, bool TouchPages,
                                   bool TouchPagesWarmup,
-                                  std::vector<uint64_t> &OutSamples,
-                                  u64 &OutPrimary, u64 &OutSecondary,
-                                  u64 &OutArena);
-
-static void runBenchRoundCombined(CombinedBenchAllocator &Alloc, bool Delegated,
-                                  uptr Size, u32 Warmup, u64 Iterations,
-                                  u64 HoldUs, bool TouchPages,
-                                  bool TouchPagesWarmup,
+                                  const char *PathLabel,
                                   std::vector<uint64_t> &OutSamples,
                                   u64 &OutPrimary, u64 &OutSecondary,
                                   u64 &OutArena) {
   if (Delegated)
     setSharedArenaForceForTesting(true);
   else
-    clearSharedArenaForceForTesting();
+    setSharedArenaForceForTesting(false);
 
   OutSamples.clear();
   OutSamples.reserve(static_cast<size_t>(Iterations) * 3U);
   const uptr PageSize = getPageSizeCached();
   constexpr unsigned char kPattern = 0x5A;
+  if (!PathLabel)
+    PathLabel = Delegated ? "delegated" : "traditional";
 
-  auto one = [&](bool Count) {
+  auto one = [&](bool Count, u64 Iter) {
+    printBenchPhase(PathLabel, Delegated, Size, !Count, Iter, "before_alloc",
+                    nullptr);
     const uint64_t T0 = nowNs();
     void *P = Alloc.allocate(Size, Chunk::Origin::Malloc);
     const uint64_t T1 = nowNs();
-    if (!P)
+    printBenchPhase(PathLabel, Delegated, Size, !Count, Iter, "after_alloc", P);
+    if (!P) {
+      fprintf(stderr, "bench_phase: path=%s size=%zu iter=%" PRIu64
+                      " alloc_failed\n",
+              PathLabel, static_cast<size_t>(Size), Iter);
       return;
+    }
     if (Count) {
       if (Alloc.isPrimaryAllocationPtr(P))
         OutPrimary++;
@@ -634,13 +822,22 @@ static void runBenchRoundCombined(CombinedBenchAllocator &Alloc, bool Delegated,
 #endif
     }
     const bool DoTouch = Count ? TouchPages : TouchPagesWarmup;
-    if (DoTouch)
+    if (DoTouch) {
+      printBenchPhase(PathLabel, Delegated, Size, !Count, Iter, "before_touch",
+                      P);
       touchAllocatedPages(P, Size, PageSize, kPattern);
+      printBenchPhase(PathLabel, Delegated, Size, !Count, Iter, "after_touch",
+                      P);
+    }
     if (HoldUs != 0)
       std::this_thread::sleep_for(std::chrono::microseconds(HoldUs));
     const uint64_t T2 = nowNs();
+    printBenchPhase(PathLabel, Delegated, Size, !Count, Iter, "before_dealloc",
+                    P);
     Alloc.deallocate(P, Chunk::Origin::Malloc);
     const uint64_t T3 = nowNs();
+    printBenchPhase(PathLabel, Delegated, Size, !Count, Iter, "after_dealloc",
+                    P);
     if (Count) {
       OutSamples.push_back(T1 - T0);
       OutSamples.push_back(T2 - T1);
@@ -649,9 +846,9 @@ static void runBenchRoundCombined(CombinedBenchAllocator &Alloc, bool Delegated,
   };
 
   for (u32 I = 0; I < Warmup; ++I)
-    one(false);
+    one(false, I);
   for (u64 I = 0; I < Iterations; ++I)
-    one(true);
+    one(true, I);
 }
 
 static void threadMainCombined(ThreadCtxCombined *Ctx) {
@@ -661,7 +858,7 @@ static void threadMainCombined(ThreadCtxCombined *Ctx) {
   }
   runBenchRoundCombined(*Ctx->Alloc, Ctx->Delegated, Ctx->Size, Ctx->Warmup,
                         Ctx->Iterations, Ctx->HoldUs, Ctx->TouchPages,
-                        Ctx->TouchPagesWarmup,
+                        Ctx->TouchPagesWarmup, Ctx->PathLabel,
                         Ctx->Samples, Ctx->PrimaryCount, Ctx->SecondaryCount,
                         Ctx->ArenaCount);
 }
@@ -673,6 +870,9 @@ int main(int argc, char **argv) {
   printf("shared_arena_latency_bench: only supported on Linux/Android.\n");
   return 0;
 #else
+  setvbuf(stdout, nullptr, _IONBF, 0);
+  setvbuf(stderr, nullptr, _IONBF, 0);
+
   const char *SelfExe = nullptr;
   u64 Iterations = 50000;
   u32 Warmup = 1000;
@@ -685,6 +885,9 @@ int main(int argc, char **argv) {
   bool IndependentProcessMode = false;
   u32 IndependentProcessCount = 4;
   bool UseCombined = false;
+  bool ArenaOnly = true;
+  bool PathModeSet = false;
+  BenchPathMode PathMode = BenchPathMode::DelegatedOnly;
 
   // Internal role: donor/worker for independent-process mode.
   const char *Role = nullptr; // "donor" | "worker"
@@ -719,6 +922,21 @@ int main(int argc, char **argv) {
     } else if (!strcmp(argv[I], "--allocator") && I + 1 < argc) {
       const char *A = argv[++I];
       UseCombined = !strcmp(A, "combined");
+    } else if (!strcmp(argv[I], "--arena-only") && I + 1 < argc) {
+      ArenaOnly = !strcmp(argv[++I], "1");
+    } else if (!strcmp(argv[I], "--path") && I + 1 < argc) {
+      const char *P = argv[++I];
+      PathModeSet = true;
+      if (!strcmp(P, "delegated")) {
+        PathMode = BenchPathMode::DelegatedOnly;
+      } else if (!strcmp(P, "traditional")) {
+        PathMode = BenchPathMode::TraditionalOnly;
+      } else if (!strcmp(P, "both")) {
+        PathMode = BenchPathMode::Both;
+      } else {
+        fprintf(stderr, "unknown --path value: %s\n", P);
+        return 1;
+      }
     } else if (!strcmp(argv[I], "--mode") && I + 1 < argc) {
       const char *M = argv[++I];
       ProcessMode = !strcmp(M, "process");
@@ -763,6 +981,9 @@ int main(int argc, char **argv) {
           "  --threads T      worker threads (default 1); each pinned to "
           "cpu 0..T-1\n"
           "  --allocator secondary|combined (default secondary)\n"
+          "  --arena-only 0|1 run only delegated SharedArena path (default 1)\n"
+          "  --path delegated|traditional|both select measured path(s); "
+          "traditional disables SharedArena before allocator init\n"
           "  --mode thread|process|independent-process (default thread)\n"
           "  --processes P    used by independent-process mode (default 4)\n"
           "  --sizes a,b,c    allocation sizes in bytes (default: built-in "
@@ -771,6 +992,11 @@ int main(int argc, char **argv) {
       return 0;
     }
   }
+
+  if (!PathModeSet)
+    PathMode = ArenaOnly ? BenchPathMode::DelegatedOnly : BenchPathMode::Both;
+  else
+    ArenaOnly = (PathMode == BenchPathMode::DelegatedOnly);
 
   // Resolve our own executable path for exec() calls.
 #if SCUDO_LINUX
@@ -807,14 +1033,14 @@ int main(int argc, char **argv) {
     if (!TouchPagesWarmupSet)
       TouchPagesWarmup = TouchPages;
 
-      // Pin after Alloc.init so SharedArenaPool::init can compute NumCores from
-      // the broader affinity mask (it uses sched_getaffinity(0,...)).
-      // Pinning too early would shrink NumCores to 1 and make getCurrentArena()
-      // reject CPUs >= NumCores.
-      if (RoleCpu >= 0 && !pinSelfToCpu(static_cast<int>(RoleCpu))) {
-        fprintf(stderr, "role %s pin cpu %u failed errno=%d\n", Role,
-                RoleCpu, errno);
-      }
+    // Pin after Alloc.init so SharedArenaPool::init can compute NumCores from
+    // the broader affinity mask (it uses sched_getaffinity(0,...)).
+    // Pinning too early would shrink NumCores to 1 and make getCurrentArena()
+    // reject CPUs >= NumCores.
+    if (!pinSelfToCpu(static_cast<int>(RoleCpu))) {
+      fprintf(stderr, "role %s pin cpu %u failed errno=%d\n", Role,
+              RoleCpu, errno);
+    }
 
     // Warmup-only donor: allocate/free Warmup blocks to seed freelist.
     if (!strcmp(Role, "donor")) {
@@ -843,14 +1069,20 @@ int main(int argc, char **argv) {
     _exit(1);
   }
 
+  const bool TraditionalOnly = PathMode == BenchPathMode::TraditionalOnly;
+  if (TraditionalOnly)
+    setenv("SCUDO_SHARED_ARENA_DISABLE", "1", 1);
+
   SharedArenaPool &Pool = SharedArenaPool::getInstance();
+  if (!TraditionalOnly)
+    Pool.init();
   GlobalStats S;
   S.init();
   LargeAllocator Alloc;
   Alloc.init(&S);
   CombinedBenchAllocator CombinedAlloc;
 
-  if (!Pool.isReady()) {
+  if (!TraditionalOnly && !Pool.isReady()) {
     fprintf(stderr,
             "SharedArenaPool not ready — delegated path unavailable. "
             "(Check shm / dev/shm.)\n");
@@ -862,8 +1094,11 @@ int main(int argc, char **argv) {
   printf("Scudo route hint: primary_max=%zu bytes\n",
          static_cast<size_t>(PrimaryMaxSize));
   printAffinity("initial");
+  printArenaDebugStats("startup", Pool);
 
-  const int PinCpu = firstUsableArenaCpu(Pool);
+  const u32 WorkerCpuCount = TraditionalOnly ? allowedCpuCount()
+                                             : Max<u32>(Pool.getNumCores(), 1);
+  const int PinCpu = TraditionalOnly ? firstAllowedCpu() : firstUsableArenaCpu(Pool);
   if (PinCpu >= 0) {
     if (!IndependentProcessMode) {
       if (pinSelfToCpu(PinCpu))
@@ -906,32 +1141,39 @@ int main(int argc, char **argv) {
             CombinedAlloc, Size, Warmup, Iterations, /*ParentDelegated=*/true,
             /*ChildDelegated=*/true, ChildPinCpu, HoldUs, TouchPages,
             TouchPagesWarmup, DelMsg);
-        Traditional = runCrossProcessForkCombined(
-            CombinedAlloc, Size, Warmup, Iterations, /*ParentDelegated=*/false,
-            /*ChildDelegated=*/false, ChildPinCpu, HoldUs, TouchPages,
-            TouchPagesWarmup, TradMsg);
+        if (!ArenaOnly)
+          Traditional = runCrossProcessForkCombined(
+              CombinedAlloc, Size, Warmup, Iterations,
+              /*ParentDelegated=*/false, /*ChildDelegated=*/false,
+              ChildPinCpu, HoldUs, TouchPages, TouchPagesWarmup, TradMsg);
       } else {
-        Traditional =
-            runCrossProcessFork(Alloc, Opt, Size, Warmup, Iterations,
-                                /*ParentDelegated=*/false,
-                                /*ChildDelegated=*/false, ChildPinCpu, HoldUs,
-                                TouchPages, TouchPagesWarmup);
         Delegated =
             runCrossProcessFork(Alloc, Opt, Size, Warmup, Iterations,
                                 /*ParentDelegated=*/true,
                                 /*ChildDelegated=*/true, ChildPinCpu, HoldUs,
                                 TouchPages, TouchPagesWarmup);
+        if (!ArenaOnly)
+          Traditional =
+              runCrossProcessFork(Alloc, Opt, Size, Warmup, Iterations,
+                                  /*ParentDelegated=*/false,
+                                  /*ChildDelegated=*/false, ChildPinCpu, HoldUs,
+                                  TouchPages, TouchPagesWarmup);
       }
 
       printf("\n================== size=%.2f %s, mode=process(fork), unit=ns ==================\n",
              HumanSize, Unit);
       printf("-- delegated (SharedArena, parent->child) --\n");
-      printStatsWithDelta("  alloc_only", Delegated.Alloc, &Traditional.Alloc);
-      printStatsWithDelta("  hold_only", Delegated.Hold, &Traditional.Hold);
+      printStatsWithDelta("  alloc_only", Delegated.Alloc,
+                           ArenaOnly ? nullptr : &Traditional.Alloc);
+      printStatsWithDelta("  hold_only", Delegated.Hold,
+                           ArenaOnly ? nullptr : &Traditional.Hold);
       printStatsWithDelta("  dealloc_only", Delegated.Dealloc,
-                           &Traditional.Dealloc);
+                           ArenaOnly ? nullptr : &Traditional.Dealloc);
       printStatsWithDelta("  all", Delegated.Round,
-                           &Traditional.Round);
+                           ArenaOnly ? nullptr : &Traditional.Round);
+      if (ArenaOnly)
+        continue;
+
       printf("-- traditional (cache/mmap, parent->child) --\n");
       if (UseCombined) {
         const char *Route = (TradMsg.SecondaryCount && TradMsg.PrimaryCount)
@@ -1165,18 +1407,25 @@ int main(int argc, char **argv) {
         return Summary;
       };
 
-      BenchSummary Traditional = runIndependent(false);
+      BenchSummary Traditional{};
+      if (!ArenaOnly)
+        Traditional = runIndependent(false);
       BenchSummary Delegated = runIndependent(true);
 
       printf("\n================== size=%.2f %s, mode=independent-process (exec), unit=ns ==================\n",
              HumanSize, Unit);
       printf("-- delegated (SharedArena, donor seeds) --\n");
-      printStatsWithDelta("  alloc_only", Delegated.Alloc, &Traditional.Alloc);
-      printStatsWithDelta("  hold_only", Delegated.Hold, &Traditional.Hold);
+      printStatsWithDelta("  alloc_only", Delegated.Alloc,
+                           ArenaOnly ? nullptr : &Traditional.Alloc);
+      printStatsWithDelta("  hold_only", Delegated.Hold,
+                           ArenaOnly ? nullptr : &Traditional.Hold);
       printStatsWithDelta("  dealloc_only", Delegated.Dealloc,
-                           &Traditional.Dealloc);
+                           ArenaOnly ? nullptr : &Traditional.Dealloc);
       printStatsWithDelta("  all", Delegated.Round,
-                           &Traditional.Round);
+                           ArenaOnly ? nullptr : &Traditional.Round);
+      if (ArenaOnly)
+        continue;
+
       printf("-- traditional (cache/mmap, Arena force-off) --\n");
       printStats("  alloc_only", Traditional.Alloc);
       printStats("  hold_only", Traditional.Hold);
@@ -1209,7 +1458,7 @@ int main(int argc, char **argv) {
           Ctxs[T].HoldUs = HoldUs;
           Ctxs[T].TouchPages = TouchPages;
           Ctxs[T].Cpu =
-              static_cast<int>(T) % static_cast<int>(Pool.getNumCores());
+              static_cast<int>(T) % static_cast<int>(WorkerCpuCount);
           Threads.emplace_back(threadMain, &Ctxs[T]);
         }
         for (auto &Th : Threads)
@@ -1229,15 +1478,14 @@ int main(int argc, char **argv) {
     auto runPathCombined = [&](bool Delegated, const char *PathLabel,
                                u64 &OutPrimary, u64 &OutSecondary,
                                u64 &OutArena) -> BenchSummary {
-      (void)PathLabel;
       BenchSummary Summary{};
       std::vector<uint64_t> CombinedSamples;
       OutPrimary = OutSecondary = OutArena = 0;
       if (ThreadCount <= 1) {
         runBenchRoundCombined(CombinedAlloc, Delegated, Size, Warmup, Iterations,
                               HoldUs, TouchPages, TouchPagesWarmup,
-                              CombinedSamples, OutPrimary, OutSecondary,
-                              OutArena);
+                              PathLabel, CombinedSamples, OutPrimary,
+                              OutSecondary, OutArena);
       } else {
         u64 Per = Iterations / ThreadCount;
         if (Per == 0)
@@ -1246,14 +1494,16 @@ int main(int argc, char **argv) {
         std::vector<std::thread> Threads;
         for (u32 T = 0; T < ThreadCount; ++T) {
           Ctxs[T].Alloc = &CombinedAlloc;
+          Ctxs[T].PathLabel = PathLabel;
           Ctxs[T].Delegated = Delegated;
           Ctxs[T].Size = Size;
           Ctxs[T].Warmup = Warmup / ThreadCount + 1;
           Ctxs[T].Iterations = Per;
           Ctxs[T].HoldUs = HoldUs;
           Ctxs[T].TouchPages = TouchPages;
+          Ctxs[T].TouchPagesWarmup = TouchPagesWarmup;
           Ctxs[T].Cpu =
-              static_cast<int>(T) % static_cast<int>(Pool.getNumCores());
+              static_cast<int>(T) % static_cast<int>(WorkerCpuCount);
           Threads.emplace_back(threadMainCombined, &Ctxs[T]);
         }
         for (auto &Th : Threads)
@@ -1275,7 +1525,9 @@ int main(int argc, char **argv) {
 
     BenchSummary Traditional{};
     BenchSummary Delegated{};
-    const bool HasDelegated = Pool.isReady();
+    const bool RunTraditional = PathMode != BenchPathMode::DelegatedOnly;
+    const bool RunDelegated = PathMode != BenchPathMode::TraditionalOnly;
+    const bool HasDelegated = RunDelegated && Pool.isReady();
 
     u32 CallsBefore = 0, HitsBefore = 0;
     u32 CallsAfter = 0, HitsAfter = 0;
@@ -1283,18 +1535,31 @@ int main(int argc, char **argv) {
     u64 PriD = 0, SecD = 0, ArenaD = 0;
 
     if (UseCombined) {
-      if (HasDelegated)
+      if (RunTraditional) {
+        CombinedAlloc.getSecondaryCacheRetrieveStats(&CallsBefore, &HitsBefore);
+        printProcMeminfo("before_traditional");
+        printArenaDebugStats("before_traditional", Pool);
+        Traditional = runPathCombined(false, "traditional (cache/mmap)", PriT,
+                                      SecT, ArenaT);
+        printArenaDebugStats("after_traditional", Pool);
+        printProcMeminfo("after_traditional");
+        CombinedAlloc.getSecondaryCacheRetrieveStats(&CallsAfter, &HitsAfter);
+      }
+      if (HasDelegated) {
+        printProcMeminfo("before_delegated");
+        printArenaDebugStats("before_delegated", Pool);
         Delegated = runPathCombined(true, "delegated (SharedArena)", PriD, SecD,
                                     ArenaD);
-      CombinedAlloc.getSecondaryCacheRetrieveStats(&CallsBefore, &HitsBefore);
-      Traditional = runPathCombined(false, "traditional (cache/mmap)", PriT, SecT,
-                                    ArenaT);
-      CombinedAlloc.getSecondaryCacheRetrieveStats(&CallsAfter, &HitsAfter);
-      const char *Route =
-          (SecT && PriT) ? "mixed" : (SecT ? "secondary" : "primary");
-      printf("route_actual: size=%zu bytes route=%s\n",
-             static_cast<size_t>(Size), Route);
-      if (SecT) {
+        printArenaDebugStats("after_delegated", Pool);
+        printProcMeminfo("after_delegated");
+      }
+      if (RunTraditional) {
+        const char *Route =
+            (SecT && PriT) ? "mixed" : (SecT ? "secondary" : "primary");
+        printf("route_actual: size=%zu bytes route=%s\n",
+               static_cast<size_t>(Size), Route);
+      }
+      if (RunTraditional && SecT) {
         const double ArenaRate =
             (SecT == 0) ? 0.0
                         : (static_cast<double>(ArenaT) * 100.0) /
@@ -1304,11 +1569,22 @@ int main(int argc, char **argv) {
                SecT, ArenaT, ArenaRate);
       }
     } else {
-      if (HasDelegated)
+      if (RunTraditional) {
+        Alloc.getCacheRetrieveStats(&CallsBefore, &HitsBefore);
+        printProcMeminfo("before_traditional");
+        printArenaDebugStats("before_traditional", Pool);
+        Traditional = runPathSecondary(false, "traditional (cache/mmap)");
+        printArenaDebugStats("after_traditional", Pool);
+        printProcMeminfo("after_traditional");
+        Alloc.getCacheRetrieveStats(&CallsAfter, &HitsAfter);
+      }
+      if (HasDelegated) {
+        printProcMeminfo("before_delegated");
+        printArenaDebugStats("before_delegated", Pool);
         Delegated = runPathSecondary(true, "delegated (SharedArena)");
-      Alloc.getCacheRetrieveStats(&CallsBefore, &HitsBefore);
-      Traditional = runPathSecondary(false, "traditional (cache/mmap)");
-      Alloc.getCacheRetrieveStats(&CallsAfter, &HitsAfter);
+        printArenaDebugStats("after_delegated", Pool);
+        printProcMeminfo("after_delegated");
+      }
     }
 
     const u32 CallsDelta = CallsAfter - CallsBefore;
@@ -1321,17 +1597,22 @@ int main(int argc, char **argv) {
     printf("\n================== size=%.2f %s, threads=%u, unit=ns ==================\n",
            HumanSize, Unit, ThreadCount);
 
-    if (Pool.isReady()) {
+    if (HasDelegated) {
       printf("-- delegated (SharedArena) --\n");
-      printStatsWithDelta("  alloc_only", Delegated.Alloc, &Traditional.Alloc);
-      printStatsWithDelta("  hold_only", Delegated.Hold, &Traditional.Hold);
+      printStatsWithDelta("  alloc_only", Delegated.Alloc,
+                           RunTraditional ? &Traditional.Alloc : nullptr);
+      printStatsWithDelta("  hold_only", Delegated.Hold,
+                           RunTraditional ? &Traditional.Hold : nullptr);
       printStatsWithDelta("  dealloc_only", Delegated.Dealloc,
-                           &Traditional.Dealloc);
+                           RunTraditional ? &Traditional.Dealloc : nullptr);
       printStatsWithDelta("  all", Delegated.Round,
-                           &Traditional.Round);
-    } else {
+                           RunTraditional ? &Traditional.Round : nullptr);
+    } else if (RunDelegated) {
       printf("-- delegated skipped (pool not ready) --\n");
     }
+    if (!RunTraditional)
+      continue;
+
     printf("-- traditional (cache/mmap) --\n");
     printf("secondary_cache_retrieve: calls=%u hits=%u hit_rate=%.2f%%\n",
            CallsDelta, HitsDelta, HitRate);
@@ -1341,7 +1622,6 @@ int main(int argc, char **argv) {
     printStats("  all", Traditional.Round);
   }
 
-  Alloc.unmapTestOnly();
   clearSharedArenaForceForTesting();
   return 0;
 #endif

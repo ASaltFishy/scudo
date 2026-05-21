@@ -11,8 +11,8 @@
 // 子课题一基础组件：面向跨进程大块内存委托的共享内存池。
 //
 // 设计要点（参见 DESIGN.md §2.1 - §2.4）：
-//  - 物理内存池化：每 CPU 核心一个共享 Arena，使用 POSIX 共享内存 (shm_open)
-//    作为物理页载体，所有参与进程映射同一 fd。
+//  - 物理内存池化：每 CPU 核心一个共享 Arena。Linux 本地测试使用 POSIX
+//    共享内存 (shm_open)；Android 通过常驻系统 broker 获取同一 backing fd。
 //  - 统一虚拟地址预留：所有进程将各核 Arena 映射到相同的固定虚拟地址区间，
 //    因此池中块的 VA 在任何进程中都有效，实现零拷贝委托。
 //  - 缓存交接：Secondary 释放大块内存时直接 store() 进 Arena 空闲列表；
@@ -20,7 +20,7 @@
 //  - rseq 快速 CPU ID：通过 rseq (Restartable Sequences) 零系统调用获取
 //    当前核心 ID，比 sched_getcpu() 快一个数量级（§2.2）。
 //  - 跨核迁移安全：释放时块存入其 VA 归属的 Arena（§2.4），跨核并发
-//    访问通过 per-Arena futex 锁保护。
+//    访问通过 per-Arena 用户态 spinlock 保护。
 //
 //===----------------------------------------------------------------------===//
 
@@ -84,11 +84,13 @@ enum class SharedArenaLogOp : u8 {
 
 struct SharedArenaLogEntry {
   u8  Op;
-  u8  Reserved;
-  u16 Reserved2;
+  u8  SrcCpu;
+  u16 Flags;
   u32 StartPage;
   u32 NumPages;
 };
+
+static constexpr u16 kLogFlagPrefault = 1u << 0;
 
 struct SharedArenaLogRing {
   u32        Magic;
@@ -128,7 +130,8 @@ struct FreeBlockHeader {
 // SharedArenaHeader：每个 Arena 共享内存前 kArenaHeaderSize 字节内的元数据
 //
 // 该结构体存放于共享内存，所有映射该 Arena 的进程均可见并可修改。
-// 跨进程锁通过 futex 实现（Lock 字段直接用于 FUTEX_WAIT/WAKE）。
+// 跨进程锁通过用户态 spinlock 实现。Arena 绑定 per-core，竞争预期很小，
+// 热路径不进入内核。
 //
 // 内存管理采用 Bump 指针 + 侵入式空闲链表混合方案（DESIGN.md §2.2）：
 //  - BumpOffsetInPages：单调递增，首次分配时推进，页面通过 page fault
@@ -163,6 +166,25 @@ struct alignas(64) SharedArenaHeader {
 static_assert(sizeof(SharedArenaHeader) <= kArenaHeaderSize,
               "SharedArenaHeader 超过了 kArenaHeaderSize，请扩大头部区域");
 
+struct SharedArenaDebugStats {
+  u32 CoreId = 0;
+  u32 Initialized = 0;
+  u32 TotalDataPages = 0;
+  u32 BumpOffsetInPages = 0;
+  u32 FreeListHeadPageOff = kFreeListEnd;
+  u32 FreeCount = 0;
+  u32 FreeListWalkCount = 0;
+  u32 FreeListBadMagic = 0;
+  uptr FreeListBytes = 0;
+  uptr TotalDonatedBytes = 0;
+  uptr TotalRetrievedBytes = 0;
+  u32 DonateCount = 0;
+  u32 RetrieveCount = 0;
+  u32 LogHead = 0;
+  u32 LogTail = 0;
+  u32 LogDropped = 0;
+};
+
 // ---------------------------------------------------------------------------
 // SharedArena：单个核心的共享 Arena
 // ---------------------------------------------------------------------------
@@ -170,7 +192,7 @@ class SharedArena {
 public:
   // 初始化 CoreId 号 Arena。
   // Linux 使用（或重新打开）POSIX 共享内存 "/scudo_arena_N"；
-  // Android 使用 memfd / ASharedMemory，并通过继承 fd 的方式 attach。
+  // Android 通过 memory_delegation_broker 分发的 fd attach。
   // 两平台都会将共享内存映射至固定 VA：
   // kSharedArenaBaseAddr + CoreId * kArenaCapacityPerCore。
   bool init(u32 CoreId);
@@ -179,7 +201,7 @@ public:
   // CommitBase / CommitSize 均为绝对 VA，位于本 Arena 数据区范围内。
   // 按 VA 地址有序插入侵入式双向空闲链表，并自动合并相邻空闲块。
   // 若日志 ring 已满则拒绝归还，避免用户态 freelist 与内核真值表失配。
-  bool store(uptr CommitBase, uptr CommitSize);
+  bool store(uptr CommitBase, uptr CommitSize, SharedArena *LogArena = nullptr);
 
   // 尝试分配一个满足 [Size + HeadersSize, Alignment] 的块。
   // 优先从侵入式空闲链表做 best-fit 查找（+ 尾部切割），
@@ -213,6 +235,7 @@ public:
   // 统计信息（调试/测试用）。
   void getStats(uptr &OutFreeCount, uptr &OutDonatedBytes,
                 uptr &OutRetrievedBytes) const;
+  void getDebugStats(SharedArenaDebugStats &Out) const;
 
   // 清空该 Arena 的共享状态，保留映射与 backing store 本身。
   // 用于 benchmark 在同一父进程下多轮独立进程对比时重新开始。
@@ -223,12 +246,18 @@ public:
   u32 getTotalDataPages() const { return Hdr ? Hdr->TotalDataPages : 0; }
 
 private:
-  // 跨进程 futex 自旋锁（存储于共享内存中的 Hdr->Lock）。
+  friend class SharedArenaPool;
+
+  // 跨进程用户态 spinlock（存储于共享内存中的 Hdr->Lock）。
   void lock();
   void unlock();
-  bool appendLogLocked(SharedArenaLogOp Op, uptr CommitBase, uptr CommitSize);
+  bool appendLogLocked(SharedArenaLogOp Op, uptr CommitBase, uptr CommitSize,
+                       u16 Flags = 0);
+  bool appendLogPagesLocked(SharedArenaLogOp Op, u8 SrcCpu, u32 StartPage,
+                            uptr CommitSize, u16 Flags = 0);
   bool initLogRing();
   bool registerWithKernel();
+  bool refreshLogRingForCurrentProcess();
   SharedArenaLogEntry *getLogEntries() const {
     return reinterpret_cast<SharedArenaLogEntry *>(
         reinterpret_cast<char *>(LogRing) + sizeof(SharedArenaLogRing));
@@ -314,6 +343,7 @@ private:
   bool checkMemoryPressure();
 
   bool        Initialized  = false;
+  uptr        OwnerPid     = 0;
   u32         NumCores     = 0;
   SharedArena Arenas[kArenaMaxCores];
 
@@ -327,9 +357,9 @@ private:
 // 调试/测试辅助：
 //  - SCUDO_SHARED_ARENA_FORCE=1: 测试时强制走共享 Arena 路径。
 //  - SCUDO_SHARED_ARENA_TRACE=1: 输出共享 Arena 关键路径日志。
-//  - SCUDO_SHARED_ARENA_ATTACH=1:
+  //  - SCUDO_SHARED_ARENA_ATTACH=1:
 //      Linux: attach 到现有具名 shm。
-//      Android: attach 到父进程继承下来的 backing fd。
+//      Android: 已不再控制 creator 路径；Android 始终依赖系统 broker。
 bool sharedArenaForceEnabled();
 void setSharedArenaForceForTesting(bool Enabled);
 void clearSharedArenaForceForTesting();

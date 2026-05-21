@@ -56,6 +56,12 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "未找到命令 $1"
 }
 
+has_ninja_target() {
+  local build_dir="$1"
+  local target="$2"
+  ninja -C "${build_dir}" -t targets all 2>/dev/null | awk -F: '{print $1}' | grep -Fxq "${target}"
+}
+
 detect_android_ndk() {
   local candidates=()
   if [[ -n "${ANDROID_NDK:-}" ]]; then
@@ -280,6 +286,7 @@ manual_android_build() {
     -pie
     -fno-exceptions
     -fno-emulated-tls
+    -DSCUDO_SHARED_ARENA_BASE_ADDR=0x1000000000ULL
     -static-libstdc++
     -pthread
     -I "${SCRIPT_DIR}"
@@ -371,7 +378,9 @@ run_android() {
     "${EXTRA_CMAKE_ARGS[@]}"
 
   echo "[2/4] 编译目标: ${target}"
-  if ! cmake --build "${build_dir}" --target "${target}" -j; then
+  if has_ninja_target "${build_dir}" "${target}"; then
+    cmake --build "${build_dir}" --target "${target}" -j
+  else
     manual_android_build "${ndk}" "${api_level}" "${arch}" "${build_dir}"
   fi
 

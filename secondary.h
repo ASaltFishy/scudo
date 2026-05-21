@@ -22,6 +22,10 @@
 #include "thread_annotations.h"
 #include "vector.h"
 
+#if SCUDO_LINUX
+#include <unistd.h>
+#endif
+
 namespace scudo {
 
 // This allocator wraps the platform allocation primitives, and as such is on
@@ -40,6 +44,10 @@ struct alignas(Max<uptr>(archSupportsMemoryTagging()
   LargeBlock::Header *Next;
   uptr CommitBase;
   uptr CommitSize;
+#if SCUDO_LINUX
+  u32 ArenaOwnerPid;
+  u32 Reserved;
+#endif
   MemMapT MemMap;
 };
 
@@ -643,6 +651,9 @@ public:
   }
 
   void enable() NO_THREAD_SAFETY_ANALYSIS {
+#if SCUDO_LINUX
+    SharedArenaPool::getInstance().init();
+#endif
     Cache.enable();
     Mutex.unlock();
   }
@@ -729,6 +740,10 @@ MapAllocator<Config>::tryAllocateFromCache(const Options &Options, uptr Size,
 
   H->CommitBase = Entry.CommitBase;
   H->CommitSize = Entry.CommitSize;
+#if SCUDO_LINUX
+  H->ArenaOwnerPid = 0;
+  H->Reserved = 0;
+#endif
   H->MemMap = Entry.MemMap;
 
   const uptr BlockEnd = H->CommitBase + H->CommitSize;
@@ -770,8 +785,8 @@ void *MapAllocator<Config>::tryAllocateFromArena(const Options &Options,
                                                   FillContentsMode FillContents) {
 
   // Arena 不支持内存标签（MTE），回退到 mmap 路径。
-  // if (useMemoryTagging<Config>(Options))
-  //   return nullptr;
+  if (useMemoryTagging<Config>(Options))
+    return nullptr;
 
   SharedArenaPool &Pool = SharedArenaPool::getInstance();
   if (!Pool.isReady())
@@ -792,11 +807,13 @@ void *MapAllocator<Config>::tryAllocateFromArena(const Options &Options,
                         OutCommitSize, OutEntryHeaderPos))
     return nullptr;
 
-  LargeBlock::Header *H = reinterpret_cast<LargeBlock::Header *>(
-      LargeBlock::addHeaderTag<Config>(OutEntryHeaderPos));
+  LargeBlock::Header *H =
+      reinterpret_cast<LargeBlock::Header *>(OutEntryHeaderPos);
 
   H->CommitBase = OutCommitBase;
   H->CommitSize = OutCommitSize;
+  H->ArenaOwnerPid = static_cast<u32>(getpid());
+  H->Reserved = 0;
   H->MemMap = MemMapT(OutCommitBase, OutCommitSize);
 
   const uptr BlockEnd = H->CommitBase + H->CommitSize;
@@ -932,6 +949,10 @@ void *MapAllocator<Config>::allocate(const Options &Options, uptr Size,
               reinterpret_cast<uptr>(H + 1));
   H->CommitBase = CommitBase;
   H->CommitSize = CommitSize;
+#if SCUDO_LINUX
+  H->ArenaOwnerPid = 0;
+  H->Reserved = 0;
+#endif
   H->MemMap = MemMap;
   if (BlockEndPtr)
     *BlockEndPtr = CommitBase + CommitSize;
@@ -953,6 +974,14 @@ template <typename Config>
 void MapAllocator<Config>::deallocate(const Options &Options, void *Ptr)
     EXCLUDES(Mutex) {
   LargeBlock::Header *H = LargeBlock::getHeader<Config>(Ptr);
+#if SCUDO_LINUX
+  if (allocatorSupportsMemoryTagging<Config>()) {
+    LargeBlock::Header *RawH = reinterpret_cast<LargeBlock::Header *>(
+        untagPointer(reinterpret_cast<uptr>(H)));
+    if (SharedArenaPool::getInstance().isArenaAddr(reinterpret_cast<uptr>(RawH)))
+      H = RawH;
+  }
+#endif
   const uptr CommitSize = H->CommitSize;
   {
     ScopedLock L(Mutex);
@@ -974,14 +1003,24 @@ void MapAllocator<Config>::deallocate(const Options &Options, void *Ptr)
     if (Pool.isReady() && Pool.isArenaAddr(FullBase)) {
       SharedArena *Owner = Pool.getOwningArena(FullBase);
       if (LIKELY(Owner != nullptr)) {
-        if (Owner->store(FullBase, FullSize)) {
-          sharedArenaTrace("deallocate return core=%u ptr=0x%zx base=0x%zx size=%zu",
-                           Owner->getCoreId(), reinterpret_cast<uptr>(Ptr),
-                           FullBase, FullSize);
+        SharedArena *LogArena = Pool.getCurrentArena();
+        if (UNLIKELY(LogArena == nullptr))
+          LogArena = Owner;
+        const u32 CurrentPid = static_cast<u32>(getpid());
+        if (UNLIKELY(H->ArenaOwnerPid != CurrentPid)) {
+          sharedArenaTrace("deallocate inherited arena block skip-return owner_pid=%u current_pid=%u ptr=0x%zx base=0x%zx size=%zu",
+                           H->ArenaOwnerPid, CurrentPid,
+                           reinterpret_cast<uptr>(Ptr), FullBase, FullSize);
+          return;
+        }
+        if (Owner->store(FullBase, FullSize, LogArena)) {
+          sharedArenaTrace("deallocate return core=%u log_core=%u ptr=0x%zx base=0x%zx size=%zu",
+                           Owner->getCoreId(), LogArena->getCoreId(),
+                           reinterpret_cast<uptr>(Ptr), FullBase, FullSize);
         } else {
-          sharedArenaTrace("deallocate skip-shared-return core=%u ptr=0x%zx base=0x%zx size=%zu",
-                           Owner->getCoreId(), reinterpret_cast<uptr>(Ptr),
-                           FullBase, FullSize);
+          sharedArenaTrace("deallocate skip-shared-return core=%u log_core=%u ptr=0x%zx base=0x%zx size=%zu",
+                           Owner->getCoreId(), LogArena->getCoreId(),
+                           reinterpret_cast<uptr>(Ptr), FullBase, FullSize);
         }
       }
       return;
