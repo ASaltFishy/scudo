@@ -108,6 +108,17 @@ struct CachedBlock {
 };
 } // namespace
 
+struct SecondaryCacheDebugStats {
+  uptr EntriesCount = 0;
+  uptr CachedBytes = 0;
+  uptr UnreleasedBytes = 0;
+  uptr ReleasedBytes = 0;
+  uptr MaxEntriesCount = 0;
+  uptr MaxEntrySize = 0;
+  u32 RetrieveCalls = 0;
+  u32 RetrieveHits = 0;
+};
+
 template <typename Config> class MapAllocatorNoCache {
 public:
   void init(UNUSED s32 ReleaseToOsInterval) {}
@@ -141,6 +152,8 @@ public:
   void getStats(UNUSED ScopedString *Str) {
     Str->append("Secondary Cache Disabled\n");
   }
+
+  void getDebugStats(SecondaryCacheDebugStats &Out) { Out = {}; }
 };
 
 static const uptr MaxUnreleasedCachePages = 4U;
@@ -238,6 +251,23 @@ public:
                   "BlockSize: %zu %s\n",
                   Entry.CommitBase, Entry.CommitBase + Entry.CommitSize,
                   Entry.CommitSize, Entry.Time == 0 ? "[R]" : "");
+    }
+  }
+
+  void getDebugStats(SecondaryCacheDebugStats &Out) {
+    ScopedLock L(Mutex);
+    Out = {};
+    Out.EntriesCount = LRUEntries.size();
+    Out.MaxEntriesCount = atomic_load_relaxed(&MaxEntriesCount);
+    Out.MaxEntrySize = atomic_load_relaxed(&MaxEntrySize);
+    Out.RetrieveCalls = CallsToRetrieve;
+    Out.RetrieveHits = SuccessfulRetrieves;
+    for (CachedBlock &Entry : LRUEntries) {
+      Out.CachedBytes += Entry.CommitSize;
+      if (Entry.Time == 0)
+        Out.ReleasedBytes += Entry.CommitSize;
+      else
+        Out.UnreleasedBytes += Entry.CommitSize;
     }
   }
 
@@ -683,6 +713,10 @@ public:
 
   void getCacheRetrieveStats(u32 *OutCalls, u32 *OutHits) {
     Cache.getRetrieveStats(OutCalls, OutHits);
+  }
+
+  void getCacheDebugStats(SecondaryCacheDebugStats &Out) {
+    Cache.getDebugStats(Out);
   }
 
 private:

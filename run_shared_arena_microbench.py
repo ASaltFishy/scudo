@@ -20,6 +20,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 RUN_BENCH_SCRIPT = SCRIPT_DIR / "run_shared_arena_latency_bench.sh"
 DEFAULT_BUILD_DIR = SCRIPT_DIR.parents[2] / "build-scudo-bench-android-aarch64"
 DEFAULT_BINARY = DEFAULT_BUILD_DIR / "ScudoSharedArenaLatencyBench-aarch64-Test"
+DEFAULT_KERNEL_TESTS_DIR = (
+    Path("/home/lrc/patent/kernel/kernel_platform/common")
+    / "tools/testing/memory_delegation/tests/out"
+)
 
 SSH_BASE_ARGS = [
     "ssh",
@@ -35,7 +39,9 @@ SIZE_RE = re.compile(
 MODE_SIZE_RE = re.compile(
     r"=+ size=(?P<human>.+?), mode=(?P<mode>.+?), unit=ns =+"
 )
-METRIC_RE = re.compile(r"^\s*(?P<metric>[a-z_]+)\s+mean=(?P<mean>[0-9.]+)")
+METRIC_RE = re.compile(
+    r"^\s*(?P<metric>[a-z_]+)\s+mean=(?P<mean>[0-9.]+)(?:\s*\([^)]+\))?"
+)
 ROUTE_HINT_RE = re.compile(
     r"^route_hint:\s+size=(?P<size_bytes>\d+)\s+bytes\s+route=(?P<route>\w+)"
 )
@@ -145,10 +151,74 @@ def deploy_binary(binary_path, remote_host, remote_stage_dir, device_dir, adb_bi
     run(["scp", str(binary_path), f"{remote_host}:{remote_stage_dir}/{binary_path.name}"])
     remote_shell(
         remote_host,
+        f"{shlex.quote(adb_bin)} shell mkdir -p {shlex.quote(device_dir)} && "
         f"{shlex.quote(adb_bin)} push {shlex.quote(remote_stage_dir + '/' + binary_path.name)} "
         f"{shlex.quote(device_dir + '/' + binary_path.name)} >/dev/null && "
         f"{shlex.quote(adb_bin)} shell chmod 755 {shlex.quote(device_dir + '/' + binary_path.name)}",
     )
+
+
+def stop_broker(remote_host, adb_bin, use_su=True):
+    if not remote_host or not adb_bin:
+        return
+    device_cmd = (
+        "for p in $(pidof memory_delegation_broker 2>/dev/null); do "
+        "kill -TERM $p || true; "
+        "done; "
+        "sleep 1; "
+        "for p in $(pidof memory_delegation_broker 2>/dev/null); do "
+        "kill -KILL $p || true; "
+        "done; true"
+    )
+    adb_remote_cmd(remote_host, adb_bin, device_cmd, use_su=use_su)
+
+
+def start_broker(remote_host, adb_bin, device_dir, broker_name, use_su=True):
+    stop_broker(remote_host, adb_bin, use_su=use_su)
+    device_cmd = (
+        f"cd {shlex.quote(device_dir)} || exit 1; "
+        f"chmod 755 {shlex.quote(broker_name)} 2>/dev/null || true; "
+        "rm -f broker.log broker.pid; "
+        f"./{shlex.quote(broker_name)} --trace >broker.log 2>&1 & "
+        "echo $! >broker.pid"
+    )
+    adb_remote_cmd(remote_host, adb_bin, device_cmd, use_su=use_su)
+
+    deadline = time.time() + 20.0
+    last_log = ""
+    while time.time() < deadline:
+        result = adb_remote_cmd(
+            remote_host,
+            adb_bin,
+            f"cd {shlex.quote(device_dir)} && cat broker.log 2>/dev/null || true",
+            capture_output=True,
+            use_su=use_su,
+        )
+        last_log = result.stdout
+        if "ready num_cores=" in last_log:
+            return
+        time.sleep(0.5)
+    raise RuntimeError(f"memory_delegation_broker 未 ready，broker.log:\n{last_log}")
+
+
+def stabilize_android_device(remote_host, adb_bin, use_su=True):
+    commands = [
+        "input keyevent KEYCODE_WAKEUP || true",
+        "wm dismiss-keyguard || true",
+        "svc power stayon true || true",
+        "settings put global window_animation_scale 0 || true",
+        "settings put global transition_animation_scale 0 || true",
+        "settings put global animator_duration_scale 0 || true",
+        "cmd power set-fixed-performance-mode-enabled true || true",
+        "dumpsys deviceidle disable || true",
+        "for f in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do "
+        "echo performance >$f 2>/dev/null || true; done",
+        "for a in com.oplus.camera com.android.camera; do "
+        "am force-stop $a 2>/dev/null || true; done",
+        "am kill-all 2>/dev/null || true",
+        "sync || true",
+    ]
+    adb_remote_cmd(remote_host, adb_bin, " ; ".join(commands), use_su=use_su)
 
 
 def kill_bench_processes(remote_host, adb_bin, binary_name, use_su=False):
@@ -167,6 +237,99 @@ def kill_bench_processes(remote_host, adb_bin, binary_name, use_su=False):
         f"bash -lc {shlex.quote(f'{adb_bin} shell {shlex.quote(device_cmd)}')}",
     ]
     subprocess.run(cmd, text=True, capture_output=True, check=False)
+
+
+def run_bench_once(
+    args,
+    binary_path,
+    adb_bin,
+    raw_path,
+    threads,
+    size,
+    path,
+    extra_bench_args,
+    extra_bench_env,
+):
+    bench_args = [
+        "--iterations",
+        str(args.iterations),
+        "--warmup",
+        str(args.warmup),
+        "--threads",
+        str(threads),
+        "--sizes",
+        str(size),
+    ]
+    bench_args.extend(extra_bench_args)
+    # Put --path last so the isolated runner overrides any old --path in
+    # --bench-extra-args.
+    bench_args.extend(["--path", path])
+
+    if args.local_linux:
+        env = os.environ.copy()
+        env["MALLOC_USE_APP_DEFAULTS"] = "1"
+        env.update(extra_bench_env)
+        try:
+            result = run(
+                [str(binary_path), *bench_args],
+                cwd=str(SCRIPT_DIR),
+                env=env,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            raw_path.write_text((exc.stdout or "") + (exc.stderr or ""), encoding="utf-8")
+            raise
+    else:
+        env_prefix = "env MALLOC_USE_APP_DEFAULTS=1"
+        for key, value in extra_bench_env.items():
+            env_prefix += f" {shlex.quote(key)}={shlex.quote(value)}"
+        shell_cmd = (
+            f"cd {shlex.quote(args.device_dir)} && "
+            f"{env_prefix} ./{shlex.quote(binary_path.name)} "
+            + " ".join(shlex.quote(item) for item in bench_args)
+        )
+        try:
+            result = adb_remote_cmd(
+                args.remote_host,
+                adb_bin,
+                shell_cmd,
+                capture_output=True,
+                use_su=args.use_su,
+            )
+        except subprocess.CalledProcessError as exc:
+            raw_path.write_text((exc.stdout or "") + (exc.stderr or ""), encoding="utf-8")
+            raise
+
+    raw_path.write_text(result.stdout, encoding="utf-8")
+    return result.stdout
+
+
+def write_outputs(all_records, results_dir, args):
+    df = pd.DataFrame([r.__dict__ for r in all_records])
+    raw_csv = results_dir / "raw_results.csv"
+    df.to_csv(raw_csv, index=False, quoting=csv.QUOTE_MINIMAL)
+
+    summary_df = build_summary_df(df)
+    summary_csv = results_dir / "summary.csv"
+    summary_df.to_csv(summary_csv, index=False, quoting=csv.QUOTE_MINIMAL)
+
+    plot_results(summary_df, results_dir)
+
+    output_md = results_dir / "summary.md"
+    write_summary_md(summary_df, output_md, args)
+
+    print(f"结果目录: {results_dir}")
+    print(f"原始数据: {raw_csv}")
+    print(f"汇总数据: {summary_csv}")
+    print(f"图表: {results_dir / 'alloc_only_latency_by_thread.png'}")
+    print(f"图表: {results_dir / 'alloc_only_latency_small_sizes.png'}")
+    print(f"图表: {results_dir / 'alloc_only_speedup_heatmap.png'}")
+    print(f"图表: {results_dir / 'alloc_only_speedup_lines.png'}")
+    print(f"图表: {results_dir / 'dealloc_only_latency_by_thread.png'}")
+    print(f"图表: {results_dir / 'dealloc_only_latency_small_sizes.png'}")
+    print(f"图表: {results_dir / 'dealloc_only_speedup_heatmap.png'}")
+    print(f"图表: {results_dir / 'dealloc_only_speedup_lines.png'}")
+    print(f"摘要: {output_md}")
 
 
 def parse_human_size_to_bytes(human):
@@ -195,30 +358,32 @@ def parse_benchmark_output(output, repetition, threads):
     current_size_bytes = None
     current_path = None
     current_route_hint = ""
+    route_by_size = {}
     current_trad_cache = {"calls": 0, "hits": 0, "rate": 0.0}
 
     for raw_line in output.splitlines():
         line = raw_line.strip()
         route_match = ROUTE_ACTUAL_RE.match(line) or ROUTE_HINT_RE.match(line)
         if route_match:
-            current_route_hint = route_match.group("route")
+            route_by_size[int(route_match.group("size_bytes"))] = route_match.group("route")
             continue
         size_match = SIZE_RE.search(line) or MODE_SIZE_RE.search(line)
         if size_match:
             current_size_human = size_match.group("human")
             current_size_bytes = parse_human_size_to_bytes(current_size_human)
             current_path = None
+            current_route_hint = route_by_size.get(current_size_bytes, "")
             current_trad_cache = {"calls": 0, "hits": 0, "rate": 0.0}
             continue
 
+        if line.startswith("-- delegated skipped"):
+            raise RuntimeError("delegated 路径被跳过，SharedArena 没有 ready")
         if line.startswith("-- delegated"):
             current_path = "delegated"
             continue
         if line.startswith("-- traditional"):
             current_path = "traditional"
             continue
-        if line.startswith("-- delegated skipped"):
-            raise RuntimeError("delegated 路径被跳过，SharedArena 没有 ready")
 
         cache_match = SECONDARY_CACHE_RE.match(line)
         if cache_match:
@@ -621,10 +786,18 @@ def write_summary_md(summary_df, output_md, args):
         f.write(f"- Remote host: `{args.remote_host}`\n")
         f.write(f"- Device dir: `{args.device_dir}`\n")
         f.write(f"- Repetitions: `{args.repetitions}`\n")
+        if hasattr(args, "cold_runs"):
+            f.write(f"- Discarded cold runs per size/path: `{args.cold_runs}`\n")
         f.write(f"- Iterations per run: `{args.iterations}`\n")
         f.write(f"- Warmup per run: `{args.warmup}`\n")
         f.write(f"- Thread counts: `{args.thread_counts}`\n")
         f.write(f"- Sizes: `{args.sizes}`\n\n")
+        if hasattr(args, "paths"):
+            f.write(
+                "- Isolation: each size/path is run in a separate process; "
+                "delegated gets a fresh broker per size; traditional runs with "
+                "the broker stopped.\n\n"
+            )
         write_metric_tables(f, summary_df, "alloc_only")
         write_metric_tables(f, summary_df, "dealloc_only")
 
@@ -690,11 +863,27 @@ def main():
     parser.add_argument("--android-ndk", default="/home/lrc/patent/kernel/kernel_platform/prebuilts/ndk-r26")
     parser.add_argument("--build-dir", default=str(DEFAULT_BUILD_DIR))
     parser.add_argument("--binary", default=str(DEFAULT_BINARY))
+    parser.add_argument(
+        "--broker-binary",
+        default="",
+        help="Android memory_delegation_broker 二进制；默认使用 --binary 同目录下的 memory_delegation_broker",
+    )
     parser.add_argument("--thread-counts", default="1,2,4,8")
     parser.add_argument("--sizes", default="65536,131072,262144,1048576")
     parser.add_argument("--iterations", type=int, default=200)
     parser.add_argument("--warmup", type=int, default=50)
-    parser.add_argument("--repetitions", type=int, default=3)
+    parser.add_argument("--repetitions", type=int, default=5)
+    parser.add_argument(
+        "--cold-runs",
+        type=int,
+        default=1,
+        help="每个 size/path 先跑多少次 cold run 并丢弃，默认 1",
+    )
+    parser.add_argument(
+        "--paths",
+        default="traditional,delegated",
+        help="隔离运行的路径，默认 traditional,delegated；最终仍合并到一张图",
+    )
     parser.add_argument(
         "--bench-extra-args",
         default="",
@@ -708,6 +897,16 @@ def main():
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--skip-deploy", action="store_true")
     parser.add_argument("--use-su", action="store_true", help="通过 adb shell su -c 运行 benchmark")
+    parser.add_argument(
+        "--no-stabilize-device",
+        action="store_true",
+        help="跳过屏幕常亮、performance governor、fixed performance mode、kill background 等设备状态固定步骤",
+    )
+    parser.add_argument(
+        "--result-prefix",
+        default="microbench",
+        help="未指定 --results-dir 时的结果目录前缀；目录名为 <prefix>-YYYYMMDD-HHMMSS",
+    )
     parser.add_argument("--results-dir", default=None)
     parser.add_argument(
         "--merge-inputs",
@@ -716,9 +915,14 @@ def main():
     )
     args = parser.parse_args()
 
-    results_dir = Path(args.results_dir) if args.results_dir else (
-        SCRIPT_DIR / "microbench-results" / datetime.now().strftime("%Y%m%d-%H%M%S")
-    )
+    if args.results_dir:
+        results_dir = Path(args.results_dir)
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        safe_prefix = re.sub(r"[^A-Za-z0-9_.-]+", "-", args.result_prefix).strip("-")
+        if not safe_prefix:
+            safe_prefix = "microbench"
+        results_dir = SCRIPT_DIR / "microbench-results" / f"{safe_prefix}-{timestamp}"
     raw_dir = results_dir / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
 
@@ -745,100 +949,101 @@ def main():
     adb_bin = None
     if not args.local_linux:
         adb_bin = detect_remote_adb_bin(args.remote_host)
+        remote_shell(args.remote_host, f"{shlex.quote(adb_bin)} wait-for-device")
+        if not args.no_stabilize_device:
+            print("[setup] stabilize Android device state", flush=True)
+            stabilize_android_device(args.remote_host, adb_bin, use_su=args.use_su)
         if not args.skip_deploy:
             deploy_binary(binary_path, args.remote_host, args.remote_stage_dir, args.device_dir, adb_bin)
 
+    broker_path = None
+    if not args.local_linux:
+        if args.broker_binary:
+            broker_path = Path(args.broker_binary)
+        else:
+            broker_path = binary_path.parent / "memory_delegation_broker"
+            if not broker_path.exists():
+                fallback = DEFAULT_KERNEL_TESTS_DIR / "memory_delegation_broker"
+                if fallback.exists():
+                    broker_path = fallback
+        if not broker_path.exists():
+            raise RuntimeError(f"未找到 broker 二进制，请传 --broker-binary: {broker_path}")
+        if not args.skip_deploy:
+            deploy_binary(broker_path, args.remote_host, args.remote_stage_dir, args.device_dir, adb_bin)
+
     all_records = []
-    for repetition in range(1, args.repetitions + 1):
-        for threads in thread_counts:
-            print(
-                f"[run] repetition={repetition}/{args.repetitions} "
-                f"threads={threads} sizes={size_arg}",
-                flush=True,
-            )
-            kill_bench_processes(args.remote_host, adb_bin, binary_path.name, args.use_su)
-            time.sleep(1)
-            raw_path = raw_dir / f"threads{threads:02d}_rep{repetition:02d}.txt"
-            if args.local_linux:
-                cmd = [
-                    str(binary_path),
-                    "--iterations",
-                    str(args.iterations),
-                    "--warmup",
-                    str(args.warmup),
-                    "--threads",
-                    str(threads),
-                    "--sizes",
-                    size_arg,
-                ]
-                cmd.extend(extra_bench_args)
-                env = os.environ.copy()
-                env["MALLOC_USE_APP_DEFAULTS"] = "1"
-                env.update(extra_bench_env)
-                try:
-                    result = run(cmd, cwd=str(SCRIPT_DIR), env=env,
-                                 capture_output=True)
-                except subprocess.CalledProcessError as exc:
-                    raw_path.write_text((exc.stdout or "") + (exc.stderr or ""),
-                                        encoding="utf-8")
-                    raise
-            else:
-                env_exports = ""
-                if extra_bench_env:
-                    env_exports = " ".join(
-                        f"export {shlex.quote(k)}={shlex.quote(v)} &&"
-                        for k, v in extra_bench_env.items()
+    paths = parse_list(args.paths)
+    valid_paths = {"traditional", "delegated"}
+    unknown_paths = [p for p in paths if p not in valid_paths]
+    if unknown_paths:
+        raise RuntimeError(f"--paths 只支持 traditional/delegated: {unknown_paths}")
+
+    for threads in thread_counts:
+        for size in size_bytes:
+            for path in paths:
+                if not args.local_linux:
+                    kill_bench_processes(args.remote_host, adb_bin, binary_path.name, args.use_su)
+                    if path == "delegated":
+                        print(
+                            f"[broker] fresh broker size={size} threads={threads}",
+                            flush=True,
+                        )
+                        start_broker(
+                            args.remote_host,
+                            adb_bin,
+                            args.device_dir,
+                            broker_path.name,
+                            use_su=args.use_su,
+                        )
+                    else:
+                        stop_broker(args.remote_host, adb_bin, use_su=args.use_su)
+
+                total_runs = args.cold_runs + args.repetitions
+                for run_index in range(total_runs):
+                    is_cold = run_index < args.cold_runs
+                    repetition = 0 if is_cold else run_index - args.cold_runs + 1
+                    raw_name = (
+                        f"threads{threads:02d}_size{size}_"
+                        f"{path}_{'cold' if is_cold else f'rep{repetition:02d}'}.txt"
                     )
-                shell_cmd = (
-                    f"cd {shlex.quote(args.device_dir)} && "
-                    f"{env_exports} env MALLOC_USE_APP_DEFAULTS=1 ./{shlex.quote(binary_path.name)} "
-                    f"--iterations {args.iterations} --warmup {args.warmup} "
-                    f"--threads {threads} --sizes {size_arg}"
-                )
-                if extra_bench_args:
-                    shell_cmd += " " + " ".join(shlex.quote(x) for x in extra_bench_args)
-                try:
-                    result = adb_remote_cmd(
-                        args.remote_host, adb_bin, shell_cmd,
-                        capture_output=True, use_su=args.use_su)
-                except subprocess.CalledProcessError as exc:
-                    raw_path.write_text((exc.stdout or "") + (exc.stderr or ""),
-                                        encoding="utf-8")
-                    raise
-            raw_path.write_text(result.stdout, encoding="utf-8")
-            records = parse_benchmark_output(result.stdout, repetition, threads)
-            all_records.extend(records)
-            print(
-                f"[done] repetition={repetition}/{args.repetitions} "
-                f"threads={threads} parsed_records={len(records)}",
-                flush=True,
-            )
+                    raw_path = raw_dir / raw_name
+                    print(
+                        f"[run] path={path} threads={threads} size={size} "
+                        f"{'cold' if is_cold else f'repetition={repetition}/{args.repetitions}'}",
+                        flush=True,
+                    )
+                    output = run_bench_once(
+                        args,
+                        binary_path,
+                        adb_bin,
+                        raw_path,
+                        threads,
+                        size,
+                        path,
+                        extra_bench_args,
+                        extra_bench_env,
+                    )
+                    if is_cold:
+                        print(
+                            f"[discard] path={path} threads={threads} size={size} cold run",
+                            flush=True,
+                        )
+                        continue
+                    records = parse_benchmark_output(output, repetition, threads)
+                    all_records.extend(records)
+                    print(
+                        f"[done] path={path} threads={threads} size={size} "
+                        f"repetition={repetition}/{args.repetitions} "
+                        f"parsed_records={len(records)}",
+                        flush=True,
+                    )
 
-    df = pd.DataFrame([r.__dict__ for r in all_records])
-    raw_csv = results_dir / "raw_results.csv"
-    df.to_csv(raw_csv, index=False, quoting=csv.QUOTE_MINIMAL)
+                if not args.local_linux and path == "delegated":
+                    stop_broker(args.remote_host, adb_bin, use_su=args.use_su)
 
-    summary_df = build_summary_df(df)
-    summary_csv = results_dir / "summary.csv"
-    summary_df.to_csv(summary_csv, index=False, quoting=csv.QUOTE_MINIMAL)
-
-    plot_results(summary_df, results_dir)
-
-    output_md = results_dir / "summary.md"
-    write_summary_md(summary_df, output_md, args)
-
-    print(f"结果目录: {results_dir}")
-    print(f"原始数据: {raw_csv}")
-    print(f"汇总数据: {summary_csv}")
-    print(f"图表: {results_dir / 'alloc_only_latency_by_thread.png'}")
-    print(f"图表: {results_dir / 'alloc_only_latency_small_sizes.png'}")
-    print(f"图表: {results_dir / 'alloc_only_speedup_heatmap.png'}")
-    print(f"图表: {results_dir / 'alloc_only_speedup_lines.png'}")
-    print(f"图表: {results_dir / 'dealloc_only_latency_by_thread.png'}")
-    print(f"图表: {results_dir / 'dealloc_only_latency_small_sizes.png'}")
-    print(f"图表: {results_dir / 'dealloc_only_speedup_heatmap.png'}")
-    print(f"图表: {results_dir / 'dealloc_only_speedup_lines.png'}")
-    print(f"摘要: {output_md}")
+    if not all_records:
+        raise RuntimeError("没有可汇总的测量记录")
+    write_outputs(all_records, results_dir, args)
 
 
 if __name__ == "__main__":

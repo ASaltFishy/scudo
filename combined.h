@@ -796,6 +796,11 @@ public:
     Secondary.getCacheRetrieveStats(OutCalls, OutHits);
   }
 
+  void getSecondaryCacheDebugStats(SecondaryCacheDebugStats &Out) {
+    initThreadMaybe();
+    Secondary.getCacheDebugStats(Out);
+  }
+
   void getStats(StatCounters S) {
     initThreadMaybe();
     Stats.get(S);

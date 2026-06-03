@@ -185,6 +185,24 @@ struct SharedArenaDebugStats {
   u32 LogDropped = 0;
 };
 
+struct SharedArenaPoolDebugStats {
+  u32 Initialized = 0;
+  u32 NumCores = 0;
+  u32 InitializedArenas = 0;
+  u32 FreeCount = 0;
+  u32 FreeListWalkCount = 0;
+  u32 FreeListBadMagic = 0;
+  uptr TotalDataBytes = 0;
+  uptr BumpBytes = 0;
+  uptr FreeListBytes = 0;
+  uptr InUseBytes = 0;
+  uptr TotalDonatedBytes = 0;
+  uptr TotalRetrievedBytes = 0;
+  u32 DonateCount = 0;
+  u32 RetrieveCount = 0;
+  u32 LogDropped = 0;
+};
+
 // ---------------------------------------------------------------------------
 // SharedArena：单个核心的共享 Arena
 // ---------------------------------------------------------------------------
@@ -328,6 +346,8 @@ public:
   bool shouldUseArena();
 
   u32 getNumCores() const { return NumCores; }
+
+  void getDebugStats(SharedArenaPoolDebugStats &Out) const;
 
   // 判断绝对 VA 是否属于任意 Arena（用于 deallocate 路由判断）。
   bool isArenaAddr(uptr Va) const {

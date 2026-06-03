@@ -35,6 +35,20 @@ __attribute__((weak)) void __scudo_realloc_deallocate_hook(void *old_ptr);
 
 void __scudo_print_stats(void);
 
+struct scudo_secondary_cache_stats {
+  uint64_t entries_count;
+  uint64_t cached_bytes;
+  uint64_t unreleased_bytes;
+  uint64_t released_bytes;
+  uint64_t max_entries_count;
+  uint64_t max_entry_size;
+  uint64_t retrieve_calls;
+  uint64_t retrieve_hits;
+};
+
+void __scudo_get_secondary_cache_stats(
+    struct scudo_secondary_cache_stats *stats);
+
 typedef void (*iterate_callback)(uintptr_t base, size_t size, void *arg);
 
 // Determine the likely cause of a tag check fault or other memory protection

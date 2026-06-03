@@ -385,8 +385,18 @@ void sharedArenaTrace(const char *Format, ...) {
       Min(sizeof(Buffer) - 1, static_cast<size_t>(PrefixLen + BodyLen));
   if (TotalLen == 0 || Buffer[TotalLen - 1] != '\n')
     Buffer[TotalLen++] = '\n';
-  ssize_t R = write(STDERR_FILENO, Buffer, TotalLen);
-  (void)R;
+
+  const char *TraceFile = getenv("SCUDO_SHARED_ARENA_TRACE_FILE");
+  if (TraceFile != nullptr && TraceFile[0] != '\0') {
+    int Fd = open(TraceFile, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+    if (Fd >= 0) {
+      ssize_t R = write(Fd, Buffer, TotalLen);
+      (void)R;
+      close(Fd);
+    }
+  }
+
+  outputRaw(Buffer);
 }
 
 // ---------------------------------------------------------------------------
@@ -1140,6 +1150,14 @@ bool SharedArenaPool::shouldUseArena() {
   return ArenaActive;
 }
 
+__attribute__((constructor)) static void sharedArenaEagerInitFromEnv() {
+  if (!sharedArenaEnvEnabled("SCUDO_SHARED_ARENA_EAGER_INIT"))
+    return;
+  SharedArenaPool::getInstance().init();
+  sharedArenaTrace("eager init constructor ready=%u",
+                   SharedArenaPool::getInstance().isReady() ? 1u : 0u);
+}
+
 // ---------------------------------------------------------------------------
 // SharedArenaPool::init
 // ---------------------------------------------------------------------------
@@ -1234,6 +1252,37 @@ void SharedArenaPool::reset() {
     if (Arenas[I].isInitialized())
       Arenas[I].reset();
   }
+}
+
+void SharedArenaPool::getDebugStats(SharedArenaPoolDebugStats &Out) const {
+  Out = {};
+  Out.Initialized = Initialized ? 1u : 0u;
+  Out.NumCores = NumCores;
+  if (!Initialized)
+    return;
+
+  const uptr PageSize = getPageSizeCached();
+  for (u32 I = 0; I < NumCores; ++I) {
+    SharedArenaDebugStats S;
+    Arenas[I].getDebugStats(S);
+    if (!S.Initialized)
+      continue;
+    Out.InitializedArenas++;
+    Out.FreeCount += S.FreeCount;
+    Out.FreeListWalkCount += S.FreeListWalkCount;
+    Out.FreeListBadMagic += S.FreeListBadMagic;
+    Out.TotalDataBytes += static_cast<uptr>(S.TotalDataPages) * PageSize;
+    Out.BumpBytes += static_cast<uptr>(S.BumpOffsetInPages) * PageSize;
+    Out.FreeListBytes += S.FreeListBytes;
+    Out.TotalDonatedBytes += S.TotalDonatedBytes;
+    Out.TotalRetrievedBytes += S.TotalRetrievedBytes;
+    Out.DonateCount += S.DonateCount;
+    Out.RetrieveCount += S.RetrieveCount;
+    Out.LogDropped += S.LogDropped;
+  }
+  Out.InUseBytes = Out.BumpBytes > Out.FreeListBytes
+                       ? Out.BumpBytes - Out.FreeListBytes
+                       : 0;
 }
 
 // ---------------------------------------------------------------------------
