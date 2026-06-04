@@ -92,11 +92,23 @@ static atomic_u32 SharedArenaEnvCacheState = {};
 static atomic_u32 SharedArenaEnvAttach = {};
 static atomic_u32 SharedArenaEnvForce = {};
 static atomic_u32 SharedArenaEnvTrace = {};
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+static atomic_u32 SharedArenaEnvProfile = {};
+#endif
 static atomic_u32 SharedArenaEnvResetOnInit = {};
 static atomic_u32 SharedArenaEnvDisable = {};
+static atomic_u32 SharedArenaEnvAllowNoKernel = {};
+static atomic_u32 SharedArenaEnvDisableFreelist = {};
+static atomic_u32 SharedArenaEnvDisableFillAlloc = {};
+static atomic_u32 SharedArenaEnvYieldAfterAllocLog = {};
+
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+static atomic_u64 SharedArenaProfileCalls[ProfileEventCount] = {};
+static atomic_u64 SharedArenaProfileNs[ProfileEventCount] = {};
+#endif
 
 static void initSharedArenaEnvCacheOnce() {
-  // 0: uninitialized, 1: initialized
+  // 0: uninitialized, 1: initializing, 2: initialized
   u32 Expected = 0u;
   if (atomic_compare_exchange_strong(&SharedArenaEnvCacheState, &Expected, 1u,
                                       memory_order_acq_rel)) {
@@ -113,6 +125,11 @@ static void initSharedArenaEnvCacheOnce() {
                                             ? 1u
                                             : 0u,
                 memory_order_relaxed);
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+    atomic_store(&SharedArenaEnvProfile,
+                 sharedArenaEnvEnabled("SCUDO_SHARED_ARENA_PROFILE") ? 1u : 0u,
+                 memory_order_relaxed);
+#endif
     atomic_store(&SharedArenaEnvResetOnInit,
                  sharedArenaEnvEnabled("SCUDO_SHARED_ARENA_RESET_ON_INIT") ? 1u
                                                                            : 0u,
@@ -120,11 +137,33 @@ static void initSharedArenaEnvCacheOnce() {
     atomic_store(&SharedArenaEnvDisable,
                  sharedArenaEnvEnabled("SCUDO_SHARED_ARENA_DISABLE") ? 1u : 0u,
                  memory_order_relaxed);
+    atomic_store(&SharedArenaEnvAllowNoKernel,
+                 sharedArenaEnvEnabled("SCUDO_SHARED_ARENA_ALLOW_NO_KERNEL")
+                     ? 1u
+                     : 0u,
+                 memory_order_relaxed);
+    atomic_store(&SharedArenaEnvDisableFreelist,
+                 sharedArenaEnvEnabled("SCUDO_SHARED_ARENA_DISABLE_FREELIST")
+                     ? 1u
+                     : 0u,
+                 memory_order_relaxed);
+    atomic_store(&SharedArenaEnvDisableFillAlloc,
+                 sharedArenaEnvEnabled("SCUDO_SHARED_ARENA_DISABLE_FILL_ALLOC")
+                     ? 1u
+                     : 0u,
+                 memory_order_relaxed);
+    atomic_store(&SharedArenaEnvYieldAfterAllocLog,
+                 sharedArenaEnvEnabled(
+                     "SCUDO_SHARED_ARENA_YIELD_AFTER_ALLOC_LOG")
+                     ? 1u
+                     : 0u,
+                 memory_order_relaxed);
+    atomic_store(&SharedArenaEnvCacheState, 2u, memory_order_release);
     return;
   }
 
   // Other threads spin until initialization completes.
-  while (atomic_load(&SharedArenaEnvCacheState, memory_order_acquire) == 0u)
+  while (atomic_load(&SharedArenaEnvCacheState, memory_order_acquire) != 2u)
     ;
 }
 
@@ -141,6 +180,27 @@ static bool sharedArenaResetOnInitEnabled() {
 static bool sharedArenaDisabled() {
   initSharedArenaEnvCacheOnce();
   return atomic_load(&SharedArenaEnvDisable, memory_order_relaxed) != 0u;
+}
+
+static bool sharedArenaAllowNoKernel() {
+  initSharedArenaEnvCacheOnce();
+  return atomic_load(&SharedArenaEnvAllowNoKernel, memory_order_relaxed) != 0u;
+}
+
+static bool sharedArenaFreelistDisabled() {
+  initSharedArenaEnvCacheOnce();
+  return atomic_load(&SharedArenaEnvDisableFreelist, memory_order_relaxed) != 0u;
+}
+
+bool sharedArenaFillAllocDisabled() {
+  initSharedArenaEnvCacheOnce();
+  return atomic_load(&SharedArenaEnvDisableFillAlloc, memory_order_relaxed) != 0u;
+}
+
+bool sharedArenaYieldAfterAllocLogEnabled() {
+  initSharedArenaEnvCacheOnce();
+  return atomic_load(&SharedArenaEnvYieldAfterAllocLog,
+                     memory_order_relaxed) != 0u;
 }
 
 #if SCUDO_ANDROID
@@ -350,6 +410,35 @@ bool sharedArenaTraceEnabled() {
   return atomic_load(&SharedArenaEnvTrace, memory_order_relaxed) != 0u;
 }
 
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+bool sharedArenaProfileEnabled() {
+  initSharedArenaEnvCacheOnce();
+  return atomic_load(&SharedArenaEnvProfile, memory_order_relaxed) != 0u;
+}
+
+void sharedArenaProfileRecord(SharedArenaProfileEvent Event, u64 DeltaNs) {
+  atomic_fetch_add(&SharedArenaProfileCalls[Event], 1ULL, memory_order_relaxed);
+  atomic_fetch_add(&SharedArenaProfileNs[Event], DeltaNs, memory_order_relaxed);
+}
+
+class SharedArenaProfileScope {
+public:
+  explicit SharedArenaProfileScope(SharedArenaProfileEvent Event)
+      : Event(Event), Enabled(sharedArenaProfileEnabled()),
+        StartNs(Enabled ? getMonotonicTime() : 0) {}
+
+  ~SharedArenaProfileScope() {
+    if (Enabled)
+      sharedArenaProfileRecord(Event, getMonotonicTime() - StartNs);
+  }
+
+private:
+  SharedArenaProfileEvent Event;
+  bool Enabled;
+  u64 StartNs;
+};
+#endif
+
 void sharedArenaTrace(const char *Format, ...) {
   if (!sharedArenaTraceEnabled())
     return;
@@ -410,6 +499,19 @@ static inline void sharedArenaSpinPause() {
 #endif
 }
 
+static bool sharedArenaFreeBlockLooksValid(const FreeBlockHeader *Blk,
+                                           u32 PageOff, u32 TotalDataPages) {
+  if (Blk->Magic != kFreeBlockMagic || Blk->SizeInPages == 0)
+    return false;
+  if (PageOff >= TotalDataPages || Blk->SizeInPages > TotalDataPages - PageOff)
+    return false;
+  if (Blk->PrevPageOff != kFreeListEnd && Blk->PrevPageOff >= TotalDataPages)
+    return false;
+  if (Blk->NextPageOff != kFreeListEnd && Blk->NextPageOff >= TotalDataPages)
+    return false;
+  return true;
+}
+
 // SharedArena::lock / unlock（跨进程用户态 spinlock）
 // ---------------------------------------------------------------------------
 
@@ -443,10 +545,14 @@ bool SharedArena::appendLogLocked(SharedArenaLogOp Op, uptr CommitBase,
 bool SharedArena::appendLogPagesLocked(SharedArenaLogOp Op, u8 SrcCpu,
                                        u32 StartPage, uptr CommitSize,
                                        u16 Flags) {
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+  SharedArenaProfileScope Profile(ProfileAppendLog);
+#endif
+
   // Bench-only no-kernel mode: the kernel does not consume the ring (Head never
   // advances). Mask out all ring operations so the arena path doesn't
   // self-disable due to a full ring. NOT safe for production semantics.
-  if (sharedArenaEnvEnabled("SCUDO_SHARED_ARENA_ALLOW_NO_KERNEL"))
+  if (sharedArenaAllowNoKernel())
     return true;
 
   DCHECK(LogRing != nullptr);
@@ -455,30 +561,37 @@ bool SharedArena::appendLogPagesLocked(SharedArenaLogOp Op, u8 SrcCpu,
   if (UNLIKELY(CommitSize == 0 || !isAligned(CommitSize, PageSize)))
     return false;
 
-  const u32 Capacity = LogRing->Capacity;
+  const u32 Capacity = LogCapacityCache;
   if (UNLIKELY(Capacity == 0))
     return false;
 
-  u32 Head = atomic_load(&LogRing->Head, memory_order_acquire);
-  u32 Tail = atomic_load(&LogRing->Tail, memory_order_relaxed);
+  u32 Head = LogHeadCache;
+  u32 Tail = LogTailCache;
   if (UNLIKELY(Tail - Head >= Capacity)) {
-    sched_yield();
     Head = atomic_load(&LogRing->Head, memory_order_acquire);
-    Tail = atomic_load(&LogRing->Tail, memory_order_relaxed);
+    LogHeadCache = Head;
     if (UNLIKELY(Tail - Head >= Capacity)) {
-      atomic_fetch_add(&LogRing->Dropped, 1u, memory_order_relaxed);
-      return false;
+      sched_yield();
+      Head = atomic_load(&LogRing->Head, memory_order_acquire);
+      LogHeadCache = Head;
+      if (UNLIKELY(Tail - Head >= Capacity)) {
+        atomic_fetch_add(&LogRing->Dropped, 1u, memory_order_relaxed);
+        return false;
+      }
     }
   }
 
+  DCHECK(isPowerOfTwo(static_cast<uptr>(Capacity)));
   SharedArenaLogEntry *Entries = getLogEntries();
-  SharedArenaLogEntry &Entry = Entries[Tail % Capacity];
+  SharedArenaLogEntry &Entry = Entries[Tail & LogCapacityMask];
   Entry.Op = static_cast<u8>(Op);
   Entry.SrcCpu = SrcCpu;
   Entry.Flags = Flags;
   Entry.StartPage = StartPage;
   Entry.NumPages = static_cast<u32>(CommitSize / PageSize);
-  atomic_store(&LogRing->Tail, Tail + 1, memory_order_release);
+  const u32 NewTail = Tail + 1;
+  atomic_store(&LogRing->Tail, NewTail, memory_order_release);
+  LogTailCache = NewTail;
   return true;
 }
 
@@ -500,17 +613,27 @@ bool SharedArena::initLogRing() {
     munmap(RingMem, PageSize);
     LogRing = nullptr;
     LogRingSize = 0;
+    LogHeadCache = 0;
+    LogTailCache = 0;
+    LogCapacityCache = 0;
+    LogCapacityMask = 0;
     return false;
   }
 
-  const u32 Capacity = static_cast<u32>((PageSize - HeaderBytes) /
-                                        sizeof(SharedArenaLogEntry));
-  if (UNLIKELY(Capacity == 0)) {
+  const u32 RawCapacity = static_cast<u32>((PageSize - HeaderBytes) /
+                                           sizeof(SharedArenaLogEntry));
+  if (UNLIKELY(RawCapacity == 0)) {
     munmap(RingMem, PageSize);
     LogRing = nullptr;
     LogRingSize = 0;
+    LogHeadCache = 0;
+    LogTailCache = 0;
+    LogCapacityCache = 0;
+    LogCapacityMask = 0;
     return false;
   }
+  const u32 Capacity =
+      static_cast<u32>(1u << getMostSignificantSetBitIndex(RawCapacity));
 
   LogRing->Magic = kLogRingMagic;
   LogRing->Version = kLogRingVersion;
@@ -521,6 +644,10 @@ bool SharedArena::initLogRing() {
   atomic_store(&LogRing->Head, 0u, memory_order_relaxed);
   atomic_store(&LogRing->Tail, 0u, memory_order_relaxed);
   atomic_store(&LogRing->Dropped, 0u, memory_order_relaxed);
+  LogHeadCache = 0;
+  LogTailCache = 0;
+  LogCapacityCache = Capacity;
+  LogCapacityMask = Capacity - 1;
   return true;
 }
 
@@ -539,7 +666,7 @@ bool SharedArena::registerWithKernel() {
   // microbench only, allow a best-effort fallback when the kernel does not
   // recognize the prctl (EINVAL). This disables kernel-side ownership tracking
   // and is NOT safe for production use.
-  if (errno == EINVAL && sharedArenaEnvEnabled("SCUDO_SHARED_ARENA_ALLOW_NO_KERNEL")) {
+  if (errno == EINVAL && sharedArenaAllowNoKernel()) {
     sharedArenaTrace("arena register core=%u: kernel prctl unsupported (EINVAL), "
                      "continuing due to SCUDO_SHARED_ARENA_ALLOW_NO_KERNEL=1",
                      CoreId);
@@ -575,6 +702,10 @@ bool SharedArena::refreshLogRingForCurrentProcess() {
     munmap(reinterpret_cast<void *>(LogRing), LogRingSize);
   LogRing = nullptr;
   LogRingSize = 0;
+  LogHeadCache = 0;
+  LogTailCache = 0;
+  LogCapacityCache = 0;
+  LogCapacityMask = 0;
 
   if (!initLogRing())
     return false;
@@ -691,6 +822,10 @@ bool SharedArena::init(u32 Id) {
     munmap(reinterpret_cast<void *>(LogRing), LogRingSize);
     LogRing = nullptr;
     LogRingSize = 0;
+    LogHeadCache = 0;
+    LogTailCache = 0;
+    LogCapacityCache = 0;
+    LogCapacityMask = 0;
     munmap(reinterpret_cast<void *>(BaseAddr), kArenaCapacityPerCore);
     close(Fd);
     Hdr = nullptr;
@@ -728,6 +863,10 @@ void SharedArena::reset() {
     atomic_store(&LogRing->Head, 0u, memory_order_relaxed);
     atomic_store(&LogRing->Tail, 0u, memory_order_relaxed);
     atomic_store(&LogRing->Dropped, 0u, memory_order_relaxed);
+    LogHeadCache = 0;
+    LogTailCache = 0;
+    LogCapacityCache = LogRing->Capacity;
+    LogCapacityMask = LogRing->Capacity - 1;
   }
 
   const uptr DataSize = kArenaCapacityPerCore - kArenaHeaderSize;
@@ -749,6 +888,15 @@ bool SharedArena::store(uptr CommitBase, uptr CommitSize, SharedArena *LogArena)
   const uptr PageSize = getPageSizeCached();
   const u32 NewPageOff = addrToPageOff(CommitBase);
   const u32 NewPages   = static_cast<u32>(CommitSize / PageSize);
+  if (UNLIKELY(!isAligned(CommitBase, PageSize) ||
+               !isAligned(CommitSize, PageSize) ||
+               NewPageOff >= Hdr->TotalDataPages ||
+               NewPages == 0 || NewPages > Hdr->TotalDataPages - NewPageOff)) {
+    sharedArenaTrace("store invalid range core=%u base=0x%zx size=%zu page_off=%u pages=%u total=%u",
+                     CoreId, CommitBase, CommitSize, NewPageOff, NewPages,
+                     Hdr != nullptr ? Hdr->TotalDataPages : 0);
+    return false;
+  }
   if (LogArena == nullptr)
     LogArena = this;
 
@@ -776,15 +924,40 @@ bool SharedArena::store(uptr CommitBase, uptr CommitSize, SharedArena *LogArena)
   if (LogArena != this)
     LogArena->unlock();
 
+  if (UNLIKELY(sharedArenaFreelistDisabled())) {
+    Hdr->TotalDonatedBytes += CommitSize;
+    Hdr->DonateCount++;
+    unlock();
+    sharedArenaTrace("store quarantine core=%u commit_base=0x%zx commit_size=%zu page_off=%u pages=%u",
+                     CoreId, CommitBase, CommitSize, NewPageOff, NewPages);
+    return true;
+  }
+
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+  const bool Profile = sharedArenaProfileEnabled();
+  const u64 StoreInsertMergeStart = Profile ? getMonotonicTime() : 0;
+#endif
+
   // 按 VA 顺序查找插入位置：找到第一个 PageOff > NewPageOff 的节点，
   // 新块插入到它的前面（PrevOff 和 NextOff 之间）。
   u32 PrevOff = kFreeListEnd;
   u32 NextOff = Hdr->FreeListHeadPageOff;
   while (NextOff != kFreeListEnd) {
+    FreeBlockHeader *NextBlk = getFreeBlock(NextOff);
+    if (UNLIKELY(!sharedArenaFreeBlockLooksValid(
+            NextBlk, NextOff, Hdr->TotalDataPages))) {
+      sharedArenaTrace("store detected corrupt freelist core=%u bad_off=%u magic=0x%x size_pages=%u",
+                       CoreId, NextOff, NextBlk->Magic, NextBlk->SizeInPages);
+      Hdr->FreeListHeadPageOff = kFreeListEnd;
+      Hdr->FreeCount = 0;
+      PrevOff = kFreeListEnd;
+      NextOff = kFreeListEnd;
+      break;
+    }
     if (NextOff > NewPageOff)
       break;
     PrevOff = NextOff;
-    NextOff = getFreeBlock(NextOff)->NextPageOff;
+    NextOff = NextBlk->NextPageOff;
   }
 
   // 写入新空闲块头部
@@ -832,6 +1005,12 @@ bool SharedArena::store(uptr CommitBase, uptr CommitSize, SharedArena *LogArena)
   Hdr->TotalDonatedBytes += CommitSize;
   Hdr->DonateCount++;
 
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+  if (Profile)
+    sharedArenaProfileRecord(ProfileStoreInsertMerge,
+                             getMonotonicTime() - StoreInsertMergeStart);
+#endif
+
   unlock();
   sharedArenaTrace("store core=%u commit_base=0x%zx commit_size=%zu page_off=%u pages=%u",
                    CoreId, CommitBase, CommitSize, NewPageOff, NewPages);
@@ -857,7 +1036,16 @@ bool SharedArena::retrieve(uptr Size, uptr Alignment, uptr HeadersSize,
   const uptr NeededSize  = roundUp(Size + HeadersSize, PageSize);
   const u32  NeededPages = static_cast<u32>(NeededSize / PageSize);
 
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+  const bool Profile = sharedArenaProfileEnabled();
+  const u64 LockStart = Profile ? getMonotonicTime() : 0;
+#endif
   lock();
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+  if (Profile)
+    sharedArenaProfileRecord(ProfileRetrieveLockWait,
+                             getMonotonicTime() - LockStart);
+#endif
 
   uptr AllocBase = 0;
   uptr AllocSize = 0;
@@ -865,10 +1053,22 @@ bool SharedArena::retrieve(uptr Size, uptr Alignment, uptr HeadersSize,
   // --- Phase 1: Best-fit 扫描侵入式空闲链表 ---
   u32  BestOff   = kFreeListEnd;
   u32  BestPages = UINT32_MAX;
-  {
+  if (!sharedArenaFreelistDisabled() && Hdr->FreeCount != 0) {
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+    const u64 ScanStart = Profile ? getMonotonicTime() : 0;
+#endif
     u32 Cur = Hdr->FreeListHeadPageOff;
     while (Cur != kFreeListEnd) {
       FreeBlockHeader *Blk = getFreeBlock(Cur);
+      if (UNLIKELY(!sharedArenaFreeBlockLooksValid(
+              Blk, Cur, Hdr->TotalDataPages))) {
+        sharedArenaTrace("retrieve detected corrupt freelist core=%u bad_off=%u magic=0x%x size_pages=%u",
+                         CoreId, Cur, Blk->Magic, Blk->SizeInPages);
+        Hdr->FreeListHeadPageOff = kFreeListEnd;
+        Hdr->FreeCount = 0;
+        BestOff = kFreeListEnd;
+        break;
+      }
       if (Blk->Magic == kFreeBlockMagic && Blk->SizeInPages >= NeededPages) {
         if (Blk->SizeInPages < BestPages) {
           BestPages = Blk->SizeInPages;
@@ -879,6 +1079,11 @@ bool SharedArena::retrieve(uptr Size, uptr Alignment, uptr HeadersSize,
       }
       Cur = Blk->NextPageOff;
     }
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+    if (Profile)
+      sharedArenaProfileRecord(ProfileFreelistScan,
+                               getMonotonicTime() - ScanStart);
+#endif
   }
 
   if (BestOff != kFreeListEnd) {
@@ -908,6 +1113,9 @@ bool SharedArena::retrieve(uptr Size, uptr Alignment, uptr HeadersSize,
 
   // --- Phase 2: Bump 指针分配 ---
   if (AllocBase == 0) {
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+    const u64 BumpStart = Profile ? getMonotonicTime() : 0;
+#endif
     const u32 BumpOff = Hdr->BumpOffsetInPages;
     if (BumpOff + NeededPages > Hdr->TotalDataPages) {
       unlock();
@@ -916,6 +1124,10 @@ bool SharedArena::retrieve(uptr Size, uptr Alignment, uptr HeadersSize,
     AllocBase = pageOffToAddr(BumpOff);
     AllocSize = NeededSize;
     Hdr->BumpOffsetInPages = BumpOff + NeededPages;
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+    if (Profile)
+      sharedArenaProfileRecord(ProfileBump, getMonotonicTime() - BumpStart);
+#endif
   }
 
   // 计算 LargeBlock::Header 落点
@@ -961,6 +1173,12 @@ bool SharedArena::retrieve(uptr Size, uptr Alignment, uptr HeadersSize,
   }
 
   unlock();
+
+  if (UNLIKELY(sharedArenaYieldAfterAllocLogEnabled())) {
+    sched_yield();
+    sharedArenaTrace("retrieve yield-after-log core=%u commit_base=0x%zx commit_size=%zu",
+                     CoreId, AllocBase, AllocSize);
+  }
 
   sharedArenaTrace("retrieve core=%u request_size=%zu alignment=%zu commit_base=0x%zx commit_size=%zu header_pos=0x%zx",
                    CoreId, Size, Alignment, AllocBase, AllocSize, HeaderPos);
@@ -1115,6 +1333,10 @@ bool SharedArenaPool::checkMemoryPressure() {
 }
 
 bool SharedArenaPool::shouldUseArena() {
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+  SharedArenaProfileScope Profile(ProfileShouldUseArena);
+#endif
+
   if (!Initialized)
     return false;
 
@@ -1258,6 +1480,73 @@ void SharedArenaPool::getDebugStats(SharedArenaPoolDebugStats &Out) const {
   Out = {};
   Out.Initialized = Initialized ? 1u : 0u;
   Out.NumCores = NumCores;
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+  Out.ProfileEnabled = sharedArenaProfileEnabled() ? 1u : 0u;
+  Out.ProfileShouldUseArenaCalls =
+      atomic_load(&SharedArenaProfileCalls[ProfileShouldUseArena],
+                  memory_order_relaxed);
+  Out.ProfileShouldUseArenaNs =
+      atomic_load(&SharedArenaProfileNs[ProfileShouldUseArena],
+                  memory_order_relaxed);
+  Out.ProfileGetCurrentArenaCalls =
+      atomic_load(&SharedArenaProfileCalls[ProfileGetCurrentArena],
+                  memory_order_relaxed);
+  Out.ProfileGetCurrentArenaNs =
+      atomic_load(&SharedArenaProfileNs[ProfileGetCurrentArena],
+                  memory_order_relaxed);
+  Out.ProfileRetrieveLockWaitCalls =
+      atomic_load(&SharedArenaProfileCalls[ProfileRetrieveLockWait],
+                  memory_order_relaxed);
+  Out.ProfileRetrieveLockWaitNs =
+      atomic_load(&SharedArenaProfileNs[ProfileRetrieveLockWait],
+                  memory_order_relaxed);
+  Out.ProfileFreelistScanCalls =
+      atomic_load(&SharedArenaProfileCalls[ProfileFreelistScan],
+                  memory_order_relaxed);
+  Out.ProfileFreelistScanNs =
+      atomic_load(&SharedArenaProfileNs[ProfileFreelistScan],
+                  memory_order_relaxed);
+  Out.ProfileBumpCalls =
+      atomic_load(&SharedArenaProfileCalls[ProfileBump], memory_order_relaxed);
+  Out.ProfileBumpNs =
+      atomic_load(&SharedArenaProfileNs[ProfileBump], memory_order_relaxed);
+  Out.ProfileAppendLogCalls =
+      atomic_load(&SharedArenaProfileCalls[ProfileAppendLog],
+                  memory_order_relaxed);
+  Out.ProfileAppendLogNs =
+      atomic_load(&SharedArenaProfileNs[ProfileAppendLog],
+                  memory_order_relaxed);
+  Out.ProfileStoreInsertMergeCalls =
+      atomic_load(&SharedArenaProfileCalls[ProfileStoreInsertMerge],
+                  memory_order_relaxed);
+  Out.ProfileStoreInsertMergeNs =
+      atomic_load(&SharedArenaProfileNs[ProfileStoreInsertMerge],
+                  memory_order_relaxed);
+  Out.ProfileArenaHeaderSetupCalls =
+      atomic_load(&SharedArenaProfileCalls[ProfileArenaHeaderSetup],
+                  memory_order_relaxed);
+  Out.ProfileArenaHeaderSetupNs =
+      atomic_load(&SharedArenaProfileNs[ProfileArenaHeaderSetup],
+                  memory_order_relaxed);
+  Out.ProfileArenaInUsePushCalls =
+      atomic_load(&SharedArenaProfileCalls[ProfileArenaInUsePush],
+                  memory_order_relaxed);
+  Out.ProfileArenaInUsePushNs =
+      atomic_load(&SharedArenaProfileNs[ProfileArenaInUsePush],
+                  memory_order_relaxed);
+  Out.ProfileArenaInUseRemoveCalls =
+      atomic_load(&SharedArenaProfileCalls[ProfileArenaInUseRemove],
+                  memory_order_relaxed);
+  Out.ProfileArenaInUseRemoveNs =
+      atomic_load(&SharedArenaProfileNs[ProfileArenaInUseRemove],
+                  memory_order_relaxed);
+  Out.ProfileArenaReturnOuterCalls =
+      atomic_load(&SharedArenaProfileCalls[ProfileArenaReturnOuter],
+                  memory_order_relaxed);
+  Out.ProfileArenaReturnOuterNs =
+      atomic_load(&SharedArenaProfileNs[ProfileArenaReturnOuter],
+                  memory_order_relaxed);
+#endif
   if (!Initialized)
     return;
 
@@ -1330,6 +1619,10 @@ static int rseqGetCpuId() {
 // ---------------------------------------------------------------------------
 
 SharedArena *SharedArenaPool::getCurrentArena() {
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+  SharedArenaProfileScope Profile(ProfileGetCurrentArena);
+#endif
+
   if (!Initialized)
     return nullptr;
 

@@ -57,6 +57,7 @@ SECONDARY_CACHE_RE = re.compile(
 class BenchRecord:
     repetition: int
     threads: int
+    touch_pages: int
     size_human: str
     size_bytes: int
     path: str
@@ -352,7 +353,8 @@ def format_size_bytes(size_bytes):
     return f"{size_bytes} B"
 
 
-def parse_benchmark_output(output, repetition, threads):
+def parse_benchmark_output(output, repetition, threads, touch_pages,
+                           expected_path=None):
     records = []
     current_size_human = None
     current_size_bytes = None
@@ -395,7 +397,8 @@ def parse_benchmark_output(output, repetition, threads):
             continue
 
         metric_match = METRIC_RE.match(line)
-        if metric_match and current_size_human and current_path:
+        if (metric_match and current_size_human and current_path and
+                (expected_path is None or current_path == expected_path)):
             cache_calls = 0
             cache_hits = 0
             cache_rate = 0.0
@@ -407,6 +410,7 @@ def parse_benchmark_output(output, repetition, threads):
                 BenchRecord(
                     repetition=repetition,
                     threads=threads,
+                    touch_pages=touch_pages,
                     size_human=current_size_human,
                     size_bytes=current_size_bytes,
                     path=current_path,
@@ -660,9 +664,12 @@ def plot_speedup_lines(summary_df, metric, output_png):
     metric_df = summary_df[summary_df["metric"] == metric].copy()
     delegated = metric_df[metric_df["path"] == "delegated"].copy()
     traditional = metric_df[metric_df["path"] == "traditional"].copy()
+    merge_cols = ["threads", "size_human", "size_bytes", "metric"]
+    if "touch_pages" in metric_df.columns:
+        merge_cols.insert(1, "touch_pages")
     merged = delegated.merge(
         traditional,
-        on=["threads", "size_human", "size_bytes", "metric"],
+        on=merge_cols,
         suffixes=("_delegated", "_traditional"),
     )
     if merged.empty:
@@ -724,11 +731,28 @@ def plot_results(summary_df, results_dir):
 
 def write_metric_tables(f, summary_df, metric):
     metric_df = summary_df[summary_df["metric"] == metric].copy()
+    touch_modes = (
+        sorted(metric_df["touch_pages"].unique())
+        if "touch_pages" in metric_df.columns
+        else [1]
+    )
+    if len(touch_modes) > 1:
+        f.write(f"## {metric_label(metric)} mean latency\n\n")
+        for touch_pages in touch_modes:
+            f.write(f"### touch_pages={touch_pages}\n\n")
+            write_metric_tables(
+                f, metric_df[metric_df["touch_pages"] == touch_pages], metric
+            )
+        return
+
     delegated = metric_df[metric_df["path"] == "delegated"].copy()
     traditional = metric_df[metric_df["path"] == "traditional"].copy()
+    merge_cols = ["threads", "size_human", "size_bytes", "metric"]
+    if "touch_pages" in metric_df.columns:
+        merge_cols.insert(1, "touch_pages")
     speedup_df = delegated.merge(
         traditional,
-        on=["threads", "size_human", "size_bytes", "metric"],
+        on=merge_cols,
         suffixes=("_delegated", "_traditional"),
     )
     speedup_df["speedup"] = (
@@ -792,6 +816,8 @@ def write_summary_md(summary_df, output_md, args):
         f.write(f"- Warmup per run: `{args.warmup}`\n")
         f.write(f"- Thread counts: `{args.thread_counts}`\n")
         f.write(f"- Sizes: `{args.sizes}`\n\n")
+        if hasattr(args, "touch_page_modes"):
+            f.write(f"- Touch page modes: `{args.touch_page_modes}`\n\n")
         if hasattr(args, "paths"):
             f.write(
                 "- Isolation: each size/path is run in a separate process; "
@@ -803,8 +829,11 @@ def write_summary_md(summary_df, output_md, args):
 
 
 def build_summary_df(df):
+    group_cols = ["threads", "size_human", "size_bytes", "path", "metric"]
+    if "touch_pages" in df.columns:
+        group_cols.insert(1, "touch_pages")
     return (
-        df.groupby(["threads", "size_human", "size_bytes", "path", "metric"], as_index=False)
+        df.groupby(group_cols, as_index=False)
         .agg(
             mean_ns=("mean_ns", "mean"),
             std_ns=("mean_ns", "std"),
@@ -894,6 +923,11 @@ def main():
         default="",
         help="额外透传给 benchmark 的环境变量，逗号分隔 K=V，例如：\"SCUDO_SHARED_ARENA_ALLOW_NO_KERNEL=1,SCUDO_SHARED_ARENA_TRACE=1\"",
     )
+    parser.add_argument(
+        "--touch-page-modes",
+        default="1",
+        help="逗号分隔的 touch-pages 模式；例如 1,0 会分别跑触页和不触页对照组",
+    )
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--skip-deploy", action="store_true")
     parser.add_argument("--use-su", action="store_true", help="通过 adb shell su -c 运行 benchmark")
@@ -933,6 +967,7 @@ def main():
     thread_counts = parse_threads(args.thread_counts)
     size_bytes = parse_sizes_bytes(args.sizes)
     size_arg = ",".join(str(x) for x in size_bytes)
+    touch_page_modes = [int(x) for x in parse_list(args.touch_page_modes)]
     extra_bench_args = shlex.split(args.bench_extra_args) if args.bench_extra_args else []
     extra_bench_env = parse_env_kv_list(args.bench_extra_env)
 
@@ -978,68 +1013,81 @@ def main():
     if unknown_paths:
         raise RuntimeError(f"--paths 只支持 traditional/delegated: {unknown_paths}")
 
-    for threads in thread_counts:
-        for size in size_bytes:
-            for path in paths:
-                if not args.local_linux:
-                    kill_bench_processes(args.remote_host, adb_bin, binary_path.name, args.use_su)
-                    if path == "delegated":
+    for touch_pages in touch_page_modes:
+        touch_extra_args = [*extra_bench_args, "--touch-pages", str(touch_pages)]
+        for threads in thread_counts:
+            for size in size_bytes:
+                for path in paths:
+                    if not args.local_linux:
+                        kill_bench_processes(
+                            args.remote_host, adb_bin, binary_path.name,
+                            args.use_su
+                        )
+                        if path == "delegated":
+                            print(
+                                f"[broker] fresh broker size={size} threads={threads}",
+                                flush=True,
+                            )
+                            start_broker(
+                                args.remote_host,
+                                adb_bin,
+                                args.device_dir,
+                                broker_path.name,
+                                use_su=args.use_su,
+                            )
+                        else:
+                            stop_broker(args.remote_host, adb_bin,
+                                        use_su=args.use_su)
+
+                    total_runs = args.cold_runs + args.repetitions
+                    for run_index in range(total_runs):
+                        is_cold = run_index < args.cold_runs
+                        repetition = (
+                            0 if is_cold else run_index - args.cold_runs + 1
+                        )
+                        raw_name = (
+                            f"touch{touch_pages}_threads{threads:02d}_size{size}_"
+                            f"{path}_{'cold' if is_cold else f'rep{repetition:02d}'}.txt"
+                        )
+                        raw_path = raw_dir / raw_name
                         print(
-                            f"[broker] fresh broker size={size} threads={threads}",
+                            f"[run] path={path} threads={threads} size={size} "
+                            f"touch_pages={touch_pages} "
+                            f"{'cold' if is_cold else f'repetition={repetition}/{args.repetitions}'}",
                             flush=True,
                         )
-                        start_broker(
-                            args.remote_host,
+                        output = run_bench_once(
+                            args,
+                            binary_path,
                             adb_bin,
-                            args.device_dir,
-                            broker_path.name,
-                            use_su=args.use_su,
+                            raw_path,
+                            threads,
+                            size,
+                            path,
+                            touch_extra_args,
+                            extra_bench_env,
                         )
-                    else:
-                        stop_broker(args.remote_host, adb_bin, use_su=args.use_su)
-
-                total_runs = args.cold_runs + args.repetitions
-                for run_index in range(total_runs):
-                    is_cold = run_index < args.cold_runs
-                    repetition = 0 if is_cold else run_index - args.cold_runs + 1
-                    raw_name = (
-                        f"threads{threads:02d}_size{size}_"
-                        f"{path}_{'cold' if is_cold else f'rep{repetition:02d}'}.txt"
-                    )
-                    raw_path = raw_dir / raw_name
-                    print(
-                        f"[run] path={path} threads={threads} size={size} "
-                        f"{'cold' if is_cold else f'repetition={repetition}/{args.repetitions}'}",
-                        flush=True,
-                    )
-                    output = run_bench_once(
-                        args,
-                        binary_path,
-                        adb_bin,
-                        raw_path,
-                        threads,
-                        size,
-                        path,
-                        extra_bench_args,
-                        extra_bench_env,
-                    )
-                    if is_cold:
+                        if is_cold:
+                            print(
+                                f"[discard] path={path} threads={threads} size={size} cold run",
+                                flush=True,
+                            )
+                            continue
+                        records = parse_benchmark_output(
+                            output, repetition, threads, touch_pages,
+                            expected_path=path,
+                        )
+                        all_records.extend(records)
                         print(
-                            f"[discard] path={path} threads={threads} size={size} cold run",
+                            f"[done] path={path} threads={threads} size={size} "
+                            f"repetition={repetition}/{args.repetitions} "
+                            f"parsed_records={len(records)}",
                             flush=True,
                         )
-                        continue
-                    records = parse_benchmark_output(output, repetition, threads)
-                    all_records.extend(records)
-                    print(
-                        f"[done] path={path} threads={threads} size={size} "
-                        f"repetition={repetition}/{args.repetitions} "
-                        f"parsed_records={len(records)}",
-                        flush=True,
-                    )
 
-                if not args.local_linux and path == "delegated":
-                    stop_broker(args.remote_host, adb_bin, use_su=args.use_su)
+                    if not args.local_linux and path == "delegated":
+                        stop_broker(args.remote_host, adb_bin,
+                                    use_su=args.use_su)
 
     if not all_records:
         raise RuntimeError("没有可汇总的测量记录")

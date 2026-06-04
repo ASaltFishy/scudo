@@ -826,6 +826,12 @@ void *MapAllocator<Config>::tryAllocateFromArena(const Options &Options,
   if (!Pool.isReady())
     return nullptr;
 
+  if (FillContents && sharedArenaFillAllocDisabled()) {
+    sharedArenaTrace("allocate bypass fill request_size=%zu alignment=%zu",
+                     Size, Alignment);
+    return nullptr;
+  }
+
   SharedArena *Arena = Pool.getCurrentArena();
   if (!Arena)
     return nullptr;
@@ -840,6 +846,11 @@ void *MapAllocator<Config>::tryAllocateFromArena(const Options &Options,
   if (!Arena->retrieve(Size, Alignment, getHeadersSize(), OutCommitBase,
                         OutCommitSize, OutEntryHeaderPos))
     return nullptr;
+
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+  const bool Profile = sharedArenaProfileEnabled();
+  u64 ProfileStart = Profile ? getMonotonicTime() : 0;
+#endif
 
   LargeBlock::Header *H =
       reinterpret_cast<LargeBlock::Header *>(OutEntryHeaderPos);
@@ -860,7 +871,14 @@ void *MapAllocator<Config>::tryAllocateFromArena(const Options &Options,
   void *Ptr = reinterpret_cast<void *>(PtrInt);
   if (FillContents)
     memset(Ptr, FillContents == ZeroFill ? 0 : PatternFillByte,
-           BlockEnd - PtrInt);
+           Size);
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+  if (Profile) {
+    sharedArenaProfileRecord(ProfileArenaHeaderSetup,
+                             getMonotonicTime() - ProfileStart);
+    ProfileStart = getMonotonicTime();
+  }
+#endif
   {
     ScopedLock L(Mutex);
     InUseBlocks.push_back(H);
@@ -871,6 +889,11 @@ void *MapAllocator<Config>::tryAllocateFromArena(const Options &Options,
     Stats.add(StatAllocated, H->CommitSize);
     Stats.add(StatMapped, H->MemMap.getCapacity());
   }
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+  if (Profile)
+    sharedArenaProfileRecord(ProfileArenaInUsePush,
+                             getMonotonicTime() - ProfileStart);
+#endif
   sharedArenaTrace("allocate hit core=%u request_size=%zu alignment=%zu ptr=0x%zx commit_base=0x%zx commit_size=%zu",
                    Arena->getCoreId(), Size, Alignment,
                    reinterpret_cast<uptr>(Ptr), OutCommitBase, OutCommitSize);
@@ -1017,6 +1040,10 @@ void MapAllocator<Config>::deallocate(const Options &Options, void *Ptr)
   }
 #endif
   const uptr CommitSize = H->CommitSize;
+#if SCUDO_LINUX && SCUDO_SHARED_ARENA_ENABLE_PROFILE
+  const bool Profile = sharedArenaProfileEnabled();
+  u64 ProfileStart = Profile ? getMonotonicTime() : 0;
+#endif
   {
     ScopedLock L(Mutex);
     InUseBlocks.remove(H);
@@ -1026,6 +1053,13 @@ void MapAllocator<Config>::deallocate(const Options &Options, void *Ptr)
     Stats.sub(StatAllocated, CommitSize);
     Stats.sub(StatMapped, H->MemMap.getCapacity());
   }
+#if SCUDO_LINUX && SCUDO_SHARED_ARENA_ENABLE_PROFILE
+  if (Profile) {
+    sharedArenaProfileRecord(ProfileArenaInUseRemove,
+                             getMonotonicTime() - ProfileStart);
+    ProfileStart = getMonotonicTime();
+  }
+#endif
 
 #if SCUDO_LINUX
   // Arena 块释放路径（DESIGN.md §2.1 缓存交接 + §2.4 跨核迁移）：
@@ -1056,6 +1090,11 @@ void MapAllocator<Config>::deallocate(const Options &Options, void *Ptr)
                            Owner->getCoreId(), LogArena->getCoreId(),
                            reinterpret_cast<uptr>(Ptr), FullBase, FullSize);
         }
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+        if (Profile)
+          sharedArenaProfileRecord(ProfileArenaReturnOuter,
+                                   getMonotonicTime() - ProfileStart);
+#endif
       }
       return;
     }

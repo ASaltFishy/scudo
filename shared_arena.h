@@ -33,6 +33,9 @@
 #include "platform.h"
 #include "thread_annotations.h"
 
+#ifndef SCUDO_SHARED_ARENA_ENABLE_PROFILE
+#define SCUDO_SHARED_ARENA_ENABLE_PROFILE 0
+#endif
 
 #if SCUDO_LINUX
 
@@ -56,6 +59,8 @@ static constexpr uptr kSharedArenaBaseAddr = 0x200000000000ULL; // 32 TB
 
 // 每个核心 Arena 的容量（512 MB）。
 static constexpr uptr kArenaCapacityPerCore = 512ULL * 1024 * 1024;
+static_assert(isPowerOfTwo(kArenaCapacityPerCore),
+              "kArenaCapacityPerCore must stay power-of-two for fast routing");
 
 // 支持的最大 CPU 核心数。
 static constexpr u32 kArenaMaxCores = 16;
@@ -201,7 +206,49 @@ struct SharedArenaPoolDebugStats {
   u32 DonateCount = 0;
   u32 RetrieveCount = 0;
   u32 LogDropped = 0;
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+  u32 ProfileEnabled = 0;
+  u64 ProfileShouldUseArenaCalls = 0;
+  u64 ProfileShouldUseArenaNs = 0;
+  u64 ProfileGetCurrentArenaCalls = 0;
+  u64 ProfileGetCurrentArenaNs = 0;
+  u64 ProfileRetrieveLockWaitCalls = 0;
+  u64 ProfileRetrieveLockWaitNs = 0;
+  u64 ProfileFreelistScanCalls = 0;
+  u64 ProfileFreelistScanNs = 0;
+  u64 ProfileBumpCalls = 0;
+  u64 ProfileBumpNs = 0;
+  u64 ProfileAppendLogCalls = 0;
+  u64 ProfileAppendLogNs = 0;
+  u64 ProfileStoreInsertMergeCalls = 0;
+  u64 ProfileStoreInsertMergeNs = 0;
+  u64 ProfileArenaHeaderSetupCalls = 0;
+  u64 ProfileArenaHeaderSetupNs = 0;
+  u64 ProfileArenaInUsePushCalls = 0;
+  u64 ProfileArenaInUsePushNs = 0;
+  u64 ProfileArenaInUseRemoveCalls = 0;
+  u64 ProfileArenaInUseRemoveNs = 0;
+  u64 ProfileArenaReturnOuterCalls = 0;
+  u64 ProfileArenaReturnOuterNs = 0;
+#endif
 };
+
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+enum SharedArenaProfileEvent : u32 {
+  ProfileShouldUseArena = 0,
+  ProfileGetCurrentArena,
+  ProfileRetrieveLockWait,
+  ProfileFreelistScan,
+  ProfileBump,
+  ProfileAppendLog,
+  ProfileStoreInsertMerge,
+  ProfileArenaHeaderSetup,
+  ProfileArenaInUsePush,
+  ProfileArenaInUseRemove,
+  ProfileArenaReturnOuter,
+  ProfileEventCount,
+};
+#endif
 
 // ---------------------------------------------------------------------------
 // SharedArena：单个核心的共享 Arena
@@ -302,6 +349,10 @@ private:
   SharedArenaHeader *Hdr        = nullptr; // 指向映射后的元数据头
   SharedArenaLogRing *LogRing   = nullptr;
   uptr              LogRingSize = 0;
+  u32               LogHeadCache = 0;
+  u32               LogTailCache = 0;
+  u32               LogCapacityCache = 0;
+  u32               LogCapacityMask = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -381,9 +432,15 @@ private:
 //      Linux: attach 到现有具名 shm。
 //      Android: 已不再控制 creator 路径；Android 始终依赖系统 broker。
 bool sharedArenaForceEnabled();
+bool sharedArenaFillAllocDisabled();
+bool sharedArenaYieldAfterAllocLogEnabled();
 void setSharedArenaForceForTesting(bool Enabled);
 void clearSharedArenaForceForTesting();
 bool sharedArenaTraceEnabled();
+#if SCUDO_SHARED_ARENA_ENABLE_PROFILE
+bool sharedArenaProfileEnabled();
+void sharedArenaProfileRecord(SharedArenaProfileEvent Event, u64 DeltaNs);
+#endif
 void sharedArenaTrace(const char *Format, ...);
 
 } // namespace scudo

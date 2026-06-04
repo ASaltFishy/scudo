@@ -69,9 +69,11 @@ static u64 getEnvU64(const char *Name, u64 Default) {
 }
 
 static bool shouldTraceBenchPhase(uptr Size, u64 Iter) {
+  if (getEnvU64("SCUDO_BENCH_TRACE_PHASE", 0) == 0)
+    return false;
   const uptr MinSize = static_cast<uptr>(
       getEnvU64("SCUDO_BENCH_TRACE_MIN_SIZE", 8ULL << 20));
-  const u64 Every = getEnvU64("SCUDO_BENCH_TRACE_EVERY", 1);
+  const u64 Every = getEnvU64("SCUDO_BENCH_TRACE_EVERY", 0);
   if (Every == 0 || Size < MinSize)
     return false;
   return (Iter % Every) == 0;
@@ -205,7 +207,84 @@ static void printArenaDebugStats(const char *Label, SharedArenaPool &Pool) {
            static_cast<size_t>(S.TotalRetrievedBytes), S.DonateCount,
            S.RetrieveCount, S.LogHead, S.LogTail, LogPending, S.LogDropped);
   }
+  SharedArenaPoolDebugStats P;
+  Pool.getDebugStats(P);
+  if (P.ProfileEnabled) {
+    printf("arena_profile: label=%s should_use_arena_calls=%llu "
+           "should_use_arena_ns=%llu get_current_arena_calls=%llu "
+           "get_current_arena_ns=%llu retrieve_lock_wait_calls=%llu "
+           "retrieve_lock_wait_ns=%llu freelist_scan_calls=%llu "
+           "freelist_scan_ns=%llu bump_calls=%llu bump_ns=%llu "
+           "append_log_calls=%llu append_log_ns=%llu "
+           "store_insert_merge_calls=%llu store_insert_merge_ns=%llu "
+           "arena_header_setup_calls=%llu arena_header_setup_ns=%llu "
+           "arena_inuse_push_calls=%llu arena_inuse_push_ns=%llu "
+           "arena_inuse_remove_calls=%llu arena_inuse_remove_ns=%llu "
+           "arena_return_outer_calls=%llu arena_return_outer_ns=%llu\n",
+           Label,
+           static_cast<unsigned long long>(P.ProfileShouldUseArenaCalls),
+           static_cast<unsigned long long>(P.ProfileShouldUseArenaNs),
+           static_cast<unsigned long long>(P.ProfileGetCurrentArenaCalls),
+           static_cast<unsigned long long>(P.ProfileGetCurrentArenaNs),
+           static_cast<unsigned long long>(P.ProfileRetrieveLockWaitCalls),
+           static_cast<unsigned long long>(P.ProfileRetrieveLockWaitNs),
+           static_cast<unsigned long long>(P.ProfileFreelistScanCalls),
+           static_cast<unsigned long long>(P.ProfileFreelistScanNs),
+           static_cast<unsigned long long>(P.ProfileBumpCalls),
+           static_cast<unsigned long long>(P.ProfileBumpNs),
+           static_cast<unsigned long long>(P.ProfileAppendLogCalls),
+           static_cast<unsigned long long>(P.ProfileAppendLogNs),
+           static_cast<unsigned long long>(P.ProfileStoreInsertMergeCalls),
+           static_cast<unsigned long long>(P.ProfileStoreInsertMergeNs),
+           static_cast<unsigned long long>(P.ProfileArenaHeaderSetupCalls),
+           static_cast<unsigned long long>(P.ProfileArenaHeaderSetupNs),
+           static_cast<unsigned long long>(P.ProfileArenaInUsePushCalls),
+           static_cast<unsigned long long>(P.ProfileArenaInUsePushNs),
+           static_cast<unsigned long long>(P.ProfileArenaInUseRemoveCalls),
+           static_cast<unsigned long long>(P.ProfileArenaInUseRemoveNs),
+           static_cast<unsigned long long>(P.ProfileArenaReturnOuterCalls),
+           static_cast<unsigned long long>(P.ProfileArenaReturnOuterNs));
+  }
   fflush(stdout);
+}
+
+static bool waitSharedArenaLogDrain(const char *Label, bool Delegated) {
+  if (!Delegated)
+    return true;
+  const u64 TimeoutMs = getEnvU64("SCUDO_BENCH_WAIT_LOG_DRAIN_MS", 20);
+  if (TimeoutMs == 0)
+    return true;
+
+  SharedArenaPool &Pool = SharedArenaPool::getInstance();
+  if (!Pool.isReady())
+    return true;
+
+  const auto Deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(TimeoutMs);
+  u32 LastPending = 0;
+  do {
+    u32 Pending = 0;
+    for (u32 Core = 0; Core < Pool.getNumCores(); ++Core) {
+      SharedArena *Arena = Pool.getArena(Core);
+      if (!Arena)
+        continue;
+      SharedArenaDebugStats S;
+      Arena->getDebugStats(S);
+      if (!S.Initialized)
+        continue;
+      Pending += S.LogTail - S.LogHead;
+    }
+    if (Pending == 0)
+      return true;
+    LastPending = Pending;
+    sched_yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  } while (std::chrono::steady_clock::now() < Deadline);
+
+  fprintf(stderr, "%s: log drain wait timeout pending=%u timeout_ms=%llu\n",
+          Label ? Label : "bench", LastPending,
+          static_cast<unsigned long long>(TimeoutMs));
+  return false;
 }
 
 static int firstUsableArenaCpu(SharedArenaPool &Pool) {
@@ -355,6 +434,7 @@ static void runBenchRound(LargeAllocator &Alloc, Options &Opt, bool Delegated,
     printBenchPhase(Label, Delegated, Size, /*WarmupPhase=*/true, I,
                     "after_dealloc", P);
   }
+  waitSharedArenaLogDrain(Label, Delegated);
 
   for (u64 I = 0; I < Iterations; ++I) {
     printBenchPhase(Label, Delegated, Size, /*WarmupPhase=*/false, I,
@@ -847,6 +927,7 @@ static void runBenchRoundCombined(CombinedBenchAllocator &Alloc, bool Delegated,
 
   for (u32 I = 0; I < Warmup; ++I)
     one(false, I);
+  waitSharedArenaLogDrain(PathLabel, Delegated);
   for (u64 I = 0; I < Iterations; ++I)
     one(true, I);
 }
